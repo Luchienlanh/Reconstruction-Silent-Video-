@@ -1,0 +1,131 @@
+Tổng quan hệ thống
+Hệ thống nhận đầu vào là một video có khuôn mặt người nói, xử lý để trích xuất chuỗi ảnh vùng môi, sau đó mã hóa thành một chuỗi vector đặc trưng liên tục theo thời gian bằng Encoder SNN (ResNet(2+1)D + Transformer + ALIF). Từ chuỗi đặc trưng này, Decoder TFiLM‑SIREN tạo ra mel‑spectrogram của giọng nói tương ứng, có thể chuyển ngược lại thành waveform bằng vocoder (ví dụ HiFi‑GAN). Toàn bộ được huấn luyện end‑to‑end với loss tái tạo trên miền mel.
+
+Bước 1: Tiền xử lý dữ liệu
+Chuẩn hóa video: Chuyển video về 25 fps, độ phân giải 1920×1080.
+
+Tách âm thanh: Trích xuất track audio, resample về 16 kHz, mono.
+
+Phát hiện khuôn mặt & trích xuất môi:
+
+Dùng MediaPipe Face Landmarker để lấy 468 điểm mốc khuôn mặt và 52 hệ số blendshape cho từng frame.
+
+Áp dụng phép biến đổi affine (dựa trên vị trí mắt) để xoay, co giãn, đưa khuôn mặt về chính diện, crop kích thước 224×224.
+
+Từ ảnh đã căn chỉnh, dùng điểm mốc môi (61, 291, 0, 17) xác định trung tâm và cắt vùng môi cố định 112×112 (ảnh xám, 1 kênh).
+
+Kết quả: chuỗi ảnh môi (T, 112, 112).
+
+Đồng bộ âm thanh: Tính mel‑spectrogram 80 băng từ audio với hop_length = sample_rate / fps = 16000/25 = 640 để đảm bảo mỗi frame video tương ứng đúng một vector mel 80 chiều. Cắt/pad để khớp số frame T với video.
+
+Bước 2: Spiking Visual Encoder
+Mục tiêu: biến chuỗi ảnh môi (dạng xám, không màu) thành chuỗi vector đặc trưng liên tục z_continuous kích thước (T, 512), chứa đựng thông tin động học của môi và âm vị.
+
+2.1. Direct Encoding
+Ảnh môi được xếp thành tensor (B, 1, T, 112, 112).
+
+Lớp đầu tiên sử dụng Conv3D tách biệt không gian – thời gian:
+
+Một Conv3D spatial kernel (1,7,7) để trích xuất đặc trưng không gian (edges, textures) trên từng frame riêng biệt.
+
+Sau BatchNorm và kích hoạt LIF (Leaky Integrate‑and‑Fire) để phát xung dựa trên đặc trưng không gian.
+
+Tiếp theo là Conv3D temporal kernel (5,1,1) để trộn thông tin giữa 5 frame liên tiếp, bắt chuyển động môi.
+
+Qua BatchNorm và LIF lần nữa, ta thu được feature map dạng xung với kích thước (B, 64, T, H', W').
+
+2.2. ResNet (2+1)D
+Sử dụng các khối SpikingBasicBlock với SpikingConv2DPlus1D (tương tự Direct Encoder: spatial Conv3D (1×3×3) + LIF + temporal Conv3D (3×1×1)).
+
+Kiến trúc ResNet gồm 4 tầng với số kênh tăng dần (64 → 128 → 256 → 512), stride giảm độ phân giải không gian và thời gian.
+
+Mỗi block có kết nối nhảy (skip connection) để giữ gradient và thông tin chi tiết. BatchNorm và LIF được đặt sau mỗi convolution.
+
+Đầu ra cuối cùng qua AdaptiveAvgPool3d (giữ nguyên chiều thời gian, thu nhỏ không gian về 1×1) và phẳng hóa thành chuỗi (B, T, 512).
+
+2.3. Spiking Vision Transformer (S‑ViT)
+Để mô hình hóa phụ thuộc toàn cục giữa các thời điểm, chuỗi (T, 512) được đưa qua một Spiking Attention:
+
+Q, K, V được tính bằng Linear, sau đó qua PLIF (Parametric LIF) để phát xung, đảm bảo tính chất spike.
+
+Attention score tính trên spike, áp dụng scale, nhân với V, rồi qua một PLIF khác.
+
+Residual connection và PLIF bao ngoài tạo thành khối Transformer.
+
+Tiếp sau attention là Spiking MLP: hai lớp Linear xen kẽ BatchNorm1d và PLIF, cũng có residual.
+
+Kết quả là một chuỗi đặc trưng spike (T, 512) đã được làm giàu ngữ cảnh thời gian.
+
+2.4. Readout với ALIF
+Đầu ra spike từ Transformer chưa phù hợp để đưa trực tiếp vào SIREN (vì tính gián đoạn). Bạn dùng một lớp Readout gồm:
+
+Linear projection để mở rộng số chiều.
+
+ConfALIFNode (Adaptive LIF): neuron LIF có ngưỡng thích nghi (a_adapt) – mô phỏng tế bào thần kinh có khả năng thích ứng, giúp duy trì thông tin dài hạn và tạo ra điện thế màng liên tục v_mem.
+
+Ta lấy chuỗi điện thế màng v_mem_seq (thay vì spike), có kích thước (T, 512), đây là biểu diễn liên tục, mượt theo thời gian.
+
+Qua LayerNorm, ta nhận được z_continuous: chuỗi vector điều kiện sẵn sàng cho decoder.
+
+Bước 3: Decoder TFiLM + SIREN
+Mục tiêu: từ chuỗi điều kiện z_continuous (mỗi frame video một vector 512D), tạo ra mel‑spectrogram hoàn chỉnh (T, 80).
+
+3.1. Temporal FiLM (TFiLM)
+Với mỗi khung thời gian t, vector z_t (512D) được đưa qua một mạng con nhỏ (ví dụ MLP 2 lớp: 512 → 256 → 2×C_siren) để sinh ra hai vector γ_t và β_t, mỗi vector có kích thước bằng số neuron của các lớp SIREN (thường 512).
+
+Như vậy ta có một chuỗi (T, 2×C_siren) các tham số điều biến.
+
+Mạng con này dùng chung cho mọi t (shared weight), có thể áp dụng độc lập từng frame hoặc dùng Conv1d nhẹ để trích xuất xu hướng thời gian nếu cần.
+
+3.2. SIREN Decoder
+SIREN là mạng MLP nhiều lớp với hàm kích hoạt sin, đặc biệt giỏi biểu diễn tín hiệu liên tục chi tiết cao.
+
+Đầu vào tọa độ: Để sinh ra một vector mel 80 chiều cho khung t, ta có thể dùng một vector constant học được (learned constant) hoặc một mã hóa vị trí tần số. Phổ biến là dùng một vector ngẫu nhiên cố định làm “tọa độ ẩn” cho tất cả các khung, rồi nhờ TFiLM điều biến để đầu ra thay đổi.
+
+Cấu trúc:
+
+Lớp đầu vào nhận vector constant + điều biến FiLM: h = sin(γ_0 ⊙ (W_0 * x + b_0) + β_0).
+
+Các lớp ẩn tiếp tục áp dụng FiLM với γ_i, β_i tương ứng được cắt từ cùng một bộ γ_t, β_t.
+
+Lớp cuối cùng là Linear không có activation, cho ra 80 giá trị mel.
+
+Áp dụng theo thời gian: Với mỗi t, ta lấy (γ_t, β_t) và chạy SIREN để sinh vector mel M_t. Lặp qua T lần (hoặc thực hiện song song bằng cách coi T như batch) ta được mel‑spectrogram đầy đủ (T, 80).
+
+3.3. Tại sao TFiLM + SIREN hiệu quả?
+TFiLM cho phép mỗi thời điểm có một bộ điều biến riêng: âm vị “a” sẽ kích hoạt các neuron sin khác với âm “m”, giúp tái tạo chính xác formant và đặc trưng phổ.
+
+SIREN sinh tín hiệu mịn, không bị staircase effect, phù hợp với phổ log‑mel vốn cần độ chính xác cao.
+
+Kết hợp TFiLM và SIREN giống như ta có một “đàn tổng hợp” mà mỗi nốt (vector điều kiện) điều khiển âm sắc thông qua việc chỉnh hệ số của các hàm sin.
+
+Bước 4: Huấn luyện
+4.1. Loss function
+Loss chính: L1 Loss hoặc MSE Loss giữa mel‑spectrogram dự đoán và mel‑spectrogram ground truth.
+
+Có thể thêm perceptual loss dùng một pretrained audio encoder (như VGGish) để so sánh đặc trưng sâu.
+
+Để tăng độ sắc nét, có thể thêm adversarial loss với discriminator CNN trên mel (như HiFi‑GAN discriminator), nhưng không bắt buộc.
+
+4.2. Chiến lược huấn luyện
+Khởi tạo cẩn thận:
+
+Các lớp Conv, BatchNorm khởi tạo theo Kaiming.
+
+SIREN khởi tạo với w = uniform(-sqrt(6/fan_in)/ω0, ...) với ω0 = 30 (tần số cơ bản).
+
+Mạng con sinh γ, β nên khởi tạo sao cho ban đầu γ≈1, β≈0 (ví dụ zero‑init lớp cuối) để SIREN hoạt động như không có FiLM, tránh phá vỡ phân phối.
+
+Tách biệt huấn luyện (khuyến nghị):
+
+Pretrain encoder SNN với một task phụ trợ (ví dụ: phân loại âm vị hoặc nhận dạng tiếng nói) để học biểu diễn môi tốt.
+Huấn luyện end‑to‑end với decoder, dùng learning rate nhỏ và gradient clipping (do SNN + SIREN đều nhạy).
+Đồng bộ thời gian: Đảm bảo số frame video và số frame mel luôn bằng T. Trong mỗi batch, các video có thể có độ dài khác nhau, cần pad hoặc dùng pack_padded với RNN (nhưng SNN không cần vì Conv3D đã xử lý T cố định). Bạn có thể huấn luyện trên các đoạn ngắn (2–3 giây) để giới hạn T.
+
+Bước 5: Suy luận
+Video test được tiền xử lý tương tự, trích xuất chuỗi môi, đưa qua encoder SNN để lấy z_continuous.
+
+SIREN lần lượt tạo từng vector mel, hoặc với T cố định có thể tạo toàn bộ một lần.
+
+Mel được chuyển thành waveform bằng vocoder (đã huấn luyện riêng) để nghe được.
+
