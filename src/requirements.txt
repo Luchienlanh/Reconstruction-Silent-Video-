@@ -1,6 +1,6 @@
 # Core libraries
-numpy==2.3.4
-scipy==1.16.3
+numpy>=2.0.0
+scipy>=1.13.0
 
 # Deep Learning (PyTorch ecosystem)
 # Note: For servers with GPUs, it's recommended to install PyTorch manually first to match the CUDA version, e.g.:
@@ -17,10 +17,10 @@ librosa==0.11.0
 speechbrain==1.1.0
 
 # Video & Image Processing
-opencv-python==4.13.0.92
-mediapipe==0.10.35
-decord==0.6.0
+opencv-python-headless>=4.8.0
+mediapipe>=0.10.0
+decord>=0.6.0
 
 # Utilities
-tqdm==4.67.1
-matplotlib==3.10.7
+tqdm>=4.65.0
+matplotlib>=3.7.0
