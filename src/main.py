@@ -24,8 +24,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     
-    data_dir = "Processed_Data_Mel_HiFiGAN"
+    data_dir = "FullFrame_test"
     dataset_output = "Dataset_Output"
+    force_full_frame_input = True
     
     if not os.path.isdir(data_dir):
         print(f"Warning: Data directory {data_dir} not found. Please ensure data is prepared.")
@@ -41,6 +42,7 @@ def main():
         use_landmarks=True,
         dataset_output_dir=dataset_output,
         enable_fallback=True,
+        force_full_frame=force_full_frame_input,
     )
     
     dataloader = DataLoader(

@@ -213,6 +213,7 @@ def run_dataset_infer(args: argparse.Namespace, device: torch.device) -> None:
         use_landmarks=True,
         dataset_output_dir=str(resolve_path(args.dataset_output_dir) or PROJECT_ROOT / "Dataset_Output"),
         enable_fallback=not args.disable_fallback,
+        force_full_frame=args.force_full_frame,
     )
 
     sample_index = args.index
@@ -298,6 +299,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smoke-only", action="store_true", help="Run dummy tensor test instead of loading dataset.")
     parser.add_argument("--num-landmark-points", type=int, default=468, help="Only used by --smoke-only.")
     parser.add_argument("--disable-fallback", action="store_true")
+    parser.add_argument("--force-full-frame", action="store_true", help="Use full source frames instead of saved lip crops.")
     return parser.parse_args()
 
 

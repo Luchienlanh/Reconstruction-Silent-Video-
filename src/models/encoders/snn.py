@@ -11,6 +11,7 @@ from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.checkpoint import checkpoint
 from tqdm.auto import tqdm
 from spikingjelly.activation_based import neuron, surrogate, functional
 
@@ -138,10 +139,8 @@ class VidResNet(nn.Module):
     # ★ Helper: checkpoint an toàn cho SNN
     def _snn_checkpoint(self, layer, X):
         """Gradient checkpointing có reset neuron states."""
-        def _forward(x):
-            functional.reset_net(layer)  # Reset v, spike của LIF/PLIF trong layer
-            return layer(x)
-        return checkpoint(_forward, X, use_reentrant=True)
+        functional.reset_net(layer)
+        return layer(X)
 
     def forward(self, X: Tensor) -> Tensor:
         X = self.stem(X)

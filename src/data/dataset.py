@@ -269,6 +269,7 @@ class VNLipDatasetV2(Dataset):
         use_landmarks: bool = True,
         dataset_output_dir: str = "Dataset_Output",
         enable_fallback: bool = True,
+        force_full_frame: bool = False,
         lost_frame_threshold: float = 0.01,
     ):
         self.data_dir = data_dir
@@ -278,6 +279,7 @@ class VNLipDatasetV2(Dataset):
         self.target_type = target_type
         self.use_landmarks = use_landmarks
         self.enable_fallback = enable_fallback
+        self.force_full_frame = force_full_frame
         self.lost_frame_threshold = lost_frame_threshold
         self.landmark_num_points = None
 
@@ -297,7 +299,7 @@ class VNLipDatasetV2(Dataset):
 
         # Build source folder map for fallback
         self.source_folder_map = {}
-        if self.enable_fallback and os.path.isdir(dataset_output_dir):
+        if (self.enable_fallback or self.force_full_frame) and os.path.isdir(dataset_output_dir):
             self.source_folder_map = build_source_folder_map(dataset_output_dir)
 
     def __len__(self) -> int:
@@ -363,6 +365,28 @@ class VNLipDatasetV2(Dataset):
 
         return video
 
+    def _apply_full_frame_input(self, video: torch.Tensor, file_name: str) -> torch.Tensor:
+        """Replace every lip-crop frame with the corresponding full source frame resized to 112x112."""
+        if not self.source_folder_map:
+            return video
+
+        safe_name = os.path.splitext(file_name)[0]
+        folder = self.source_folder_map.get(safe_name)
+        if folder is None:
+            return video
+
+        video_candidates = glob.glob(os.path.join(folder, "video.*"))
+        if not video_candidates:
+            return video
+
+        source_video_path = video_candidates[0]
+        full_frames = video.clone()
+        for t in range(video.shape[1]):
+            face_frame = load_fallback_face_frame(source_video_path, t)
+            if face_frame is not None:
+                full_frames[0, t] = face_frame
+        return full_frames
+
     def _crop(self, video, target, target_len, landmarks=None, data=None):
         video_len = int(data.get("video_len", video.shape[1])) if data else video.shape[1]
         video_len = min(video_len, video.shape[1])
@@ -406,8 +430,12 @@ class VNLipDatasetV2(Dataset):
                 f"Sai shape trong {file_path}: video={tuple(video.shape)}, target={tuple(target.shape)}"
             )
 
+        # --- Optional full-frame visual input ---
+        if self.force_full_frame:
+            video = self._apply_full_frame_input(video, file_name)
+
         # --- Fallback for lost frames ---
-        if self.enable_fallback:
+        if self.enable_fallback and not self.force_full_frame:
             lost_mask = self._detect_lost_frames(video)
             if lost_mask.any():
                 video = self._apply_fallback(video, lost_mask, file_name)
