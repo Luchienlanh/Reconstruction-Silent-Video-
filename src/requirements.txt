@@ -1,0 +1,26 @@
+# Core libraries
+numpy==2.3.4
+scipy==1.16.3
+
+# Deep Learning (PyTorch ecosystem)
+# Note: For servers with GPUs, it's recommended to install PyTorch manually first to match the CUDA version, e.g.:
+# pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+
+# SNN Framework
+spikingjelly==0.0.0.0.14
+
+# Audio Processing & Vocoder
+librosa==0.11.0
+speechbrain==1.1.0
+
+# Video & Image Processing
+opencv-python==4.13.0.92
+mediapipe==0.10.35
+decord==0.6.0
+
+# Utilities
+tqdm==4.67.1
+matplotlib==3.10.7
