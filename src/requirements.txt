@@ -1,26 +1,36 @@
-# Core libraries
+# Core numeric stack
 numpy>=2.0.0
 scipy>=1.13.0
+joblib>=1.3.0
 
-# Deep Learning (PyTorch ecosystem)
-# Note: For servers with GPUs, it's recommended to install PyTorch manually first to match the CUDA version, e.g.:
+# PyTorch stack
+# For CUDA servers, install the matching PyTorch build first if needed, for example:
 # pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 torch==2.6.0
 torchvision==0.21.0
 torchaudio==2.6.0
 
-# SNN Framework
+# SNN framework
 spikingjelly==0.0.0.0.14
 
-# Audio Processing & Vocoder
+# Audio, mel features, and HiFi-GAN vocoder
 librosa==0.11.0
+soundfile>=0.12.1
 speechbrain==1.1.0
+huggingface_hub>=0.24.0
+hyperpyyaml>=1.2.2
+sentencepiece>=0.2.0
 
-# Video & Image Processing
+# Video/image preprocessing
 opencv-python-headless>=4.8.0
 mediapipe>=0.10.0
 decord>=0.6.0
 
-# Utilities
+# Utilities and plotting
 tqdm>=4.65.0
 matplotlib>=3.7.0
+
+# Notes:
+# - ffmpeg is required for some video/audio workflows, but install it as a system package,
+#   not via pip. Examples: apt-get install ffmpeg, conda install -c conda-forge ffmpeg,
+#   or winget/choco on Windows.
