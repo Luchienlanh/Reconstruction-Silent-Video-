@@ -31,8 +31,12 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from data.dataset import VNLipDatasetV2, collate_pad_v2  # noqa: E402
+from models.decoders.dual import DualDecoder, DualWrapDecoder  # noqa: E402
+from models.decoders.finer import TFiLMFINERDecoder  # noqa: E402
 from models.decoders.siren import TFiLMSIRENDecoder  # noqa: E402
 from models.decoders.upsample import MelTemporalUpsampleDecoder  # noqa: E402
+from models.decoders.wire import TFiLMWIREDecoder  # noqa: E402
+from models.decoders.wrap import TFiLMWrapFISINDecoder, TFiLMWrapFIWIDecoder  # noqa: E402
 from models.encoders.factory import VisualLandmarkEncoderV2, build_encoder  # noqa: E402
 from models.loss import MelReconstructionLoss  # noqa: E402
 
@@ -51,7 +55,7 @@ def resolve_path(path: Optional[str]) -> Optional[Path]:
 
 
 def default_data_dir() -> str:
-    full_frame = PROJECT_ROOT / "Processed_Data_Mel_HiFiGAN_FullFrame"
+    full_frame = PROJECT_ROOT / "FullFrame_test"
     if full_frame.is_dir():
         return "Processed_Data_Mel_HiFiGAN_FullFrame"
     return "Processed_Data_Mel_HiFiGAN"
@@ -73,7 +77,27 @@ def reset_snn_if_needed(module: torch.nn.Module, encoder_type: str) -> None:
     functional.reset_net(module)
 
 
-def build_models(device: torch.device, encoder_type: str, num_landmark_points: int):
+def build_base_decoder(decoder_type: str):
+    decoder_type = decoder_type.lower()
+    common = dict(hidden_dim=256, out_dim=80, num_layers=4, use_conv=True)
+    if decoder_type == "siren":
+        return TFiLMSIRENDecoder(**common, output_activation=None)
+    if decoder_type == "wire":
+        return TFiLMWIREDecoder(**common)
+    if decoder_type == "finer":
+        return TFiLMFINERDecoder(**common)
+    if decoder_type == "dual":
+        return DualDecoder(**common)
+    if decoder_type in {"dual_wrap", "dualwrap"}:
+        return DualWrapDecoder(**common)
+    if decoder_type in {"wrap_siren", "wrap_fisin", "wrap"}:
+        return TFiLMWrapFISINDecoder(**common)
+    if decoder_type in {"wrap_wire", "wrap_fiwi"}:
+        return TFiLMWrapFIWIDecoder(**common)
+    raise ValueError(f"Unknown decoder_type: {decoder_type}")
+
+
+def build_models(device: torch.device, encoder_type: str, decoder_type: str, num_landmark_points: int):
     visual_encoder = build_encoder(encoder_type).to(device)
     encoder = VisualLandmarkEncoderV2(
         visual_encoder,
@@ -81,13 +105,7 @@ def build_models(device: torch.device, encoder_type: str, num_landmark_points: i
         z_dim=512,
     ).to(device)
 
-    base_decoder = TFiLMSIRENDecoder(
-        hidden_dim=256,
-        out_dim=80,
-        num_layers=4,
-        use_conv=True,
-        output_activation=None,
-    ).to(device)
+    base_decoder = build_base_decoder(decoder_type).to(device)
     decoder = MelTemporalUpsampleDecoder(
         base_decoder,
         sample_rate=16000,
@@ -365,7 +383,7 @@ def run(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     dataset, train_loader, val_loader, train_count, val_count = create_loaders(args)
-    encoder, decoder = build_models(device, args.encoder_type, dataset.landmark_num_points)
+    encoder, decoder = build_models(device, args.encoder_type, args.decoder_type, dataset.landmark_num_points)
     criterion = make_criterion(args, device)
     optimizer = torch.optim.AdamW(
         list(encoder.parameters()) + list(decoder.parameters()),
@@ -384,7 +402,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"[device] {device}")
     print(f"[data] {safe_text(resolve_path(args.data_dir))}")
     print(f"[split] train={train_count} val={val_count}")
-    print(f"[model] encoder={args.encoder_type} landmarks={dataset.landmark_num_points}")
+    print(f"[model] encoder={args.encoder_type} decoder={args.decoder_type} landmarks={dataset.landmark_num_points}")
     print(
         "[loss] mel=1.0 delta={} delta2={} energy={}".format(
             args.lambda_delta,
@@ -485,6 +503,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="simple_mel_checkpoints")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--encoder-type", default="non_snn", choices=["non_snn", "nonsnn", "cnn_transformer", "snn"])
+    parser.add_argument(
+        "--decoder-type",
+        default="siren",
+        choices=["siren", "wire", "finer", "dual", "dual_wrap", "wrap_siren", "wrap_fisin", "wrap", "wrap_wire", "wrap_fiwi"],
+    )
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=4)
