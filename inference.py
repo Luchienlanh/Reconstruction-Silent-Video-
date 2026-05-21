@@ -27,8 +27,12 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from data.dataset import VNLipDatasetV2, collate_pad_v2  # noqa: E402
+from models.decoders.dual import DualDecoder, DualWrapDecoder  # noqa: E402
+from models.decoders.finer import TFiLMFINERDecoder  # noqa: E402
 from models.decoders.siren import TFiLMSIRENDecoder  # noqa: E402
 from models.decoders.upsample import MelTemporalUpsampleDecoder  # noqa: E402
+from models.decoders.wire import TFiLMWIREDecoder  # noqa: E402
+from models.decoders.wrap import TFiLMWrapFISINDecoder, TFiLMWrapFIWIDecoder  # noqa: E402
 from models.encoders.factory import VisualLandmarkEncoderV2, build_encoder  # noqa: E402
 
 
@@ -68,7 +72,27 @@ def config_value(args: argparse.Namespace, ckpt_config: dict, name: str, default
     return ckpt_config.get(name, default)
 
 
-def build_models(device: torch.device, encoder_type: str, num_landmark_points: int):
+def build_base_decoder(decoder_type: str):
+    decoder_type = decoder_type.lower()
+    common = dict(hidden_dim=256, out_dim=80, num_layers=4, use_conv=True)
+    if decoder_type == "siren":
+        return TFiLMSIRENDecoder(**common, output_activation=None)
+    if decoder_type == "wire":
+        return TFiLMWIREDecoder(**common)
+    if decoder_type == "finer":
+        return TFiLMFINERDecoder(**common)
+    if decoder_type == "dual":
+        return DualDecoder(**common)
+    if decoder_type in {"dual_wrap", "dualwrap"}:
+        return DualWrapDecoder(**common)
+    if decoder_type in {"wrap_siren", "wrap_fisin", "wrap"}:
+        return TFiLMWrapFISINDecoder(**common)
+    if decoder_type in {"wrap_wire", "wrap_fiwi"}:
+        return TFiLMWrapFIWIDecoder(**common)
+    raise ValueError(f"Unknown decoder_type: {decoder_type}")
+
+
+def build_models(device: torch.device, encoder_type: str, decoder_type: str, num_landmark_points: int):
     visual_encoder = build_encoder(encoder_type).to(device)
     encoder = VisualLandmarkEncoderV2(
         visual_encoder,
@@ -76,13 +100,7 @@ def build_models(device: torch.device, encoder_type: str, num_landmark_points: i
         z_dim=512,
     ).to(device)
 
-    base_decoder = TFiLMSIRENDecoder(
-        hidden_dim=256,
-        out_dim=80,
-        num_layers=4,
-        use_conv=True,
-        output_activation=None,
-    ).to(device)
+    base_decoder = build_base_decoder(decoder_type).to(device)
     decoder = MelTemporalUpsampleDecoder(
         base_decoder,
         sample_rate=16000,
@@ -217,7 +235,8 @@ def run(args: argparse.Namespace) -> None:
 
     dataset, data_dir, max_frames = create_dataset(args, ckpt_config)
     encoder_type = args.encoder_type or ckpt_config.get("encoder_type", "non_snn")
-    encoder, decoder = build_models(device, encoder_type, dataset.landmark_num_points)
+    decoder_type = args.decoder_type or ckpt_config.get("decoder_type", "siren")
+    encoder, decoder = build_models(device, encoder_type, decoder_type, dataset.landmark_num_points)
     encoder.load_state_dict(ckpt["encoder_state_dict"], strict=True)
     decoder.load_state_dict(ckpt["decoder_state_dict"], strict=True)
 
@@ -227,7 +246,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"[device] {device}")
     print(f"[checkpoint] {safe_text(checkpoint_path)}")
     print(f"[data] {safe_text(data_dir)}")
-    print(f"[model] encoder={encoder_type} landmarks={dataset.landmark_num_points} max_frames={max_frames}")
+    print(f"[model] encoder={encoder_type} decoder={decoder_type} landmarks={dataset.landmark_num_points} max_frames={max_frames}")
 
     start = 0 if args.sample else args.index
     indices = [start] if args.sample else list(range(start, min(start + args.num_samples, len(dataset))))
@@ -287,6 +306,7 @@ def run(args: argparse.Namespace) -> None:
                 "checkpoint": str(checkpoint_path),
                 "data_dir": str(data_dir),
                 "encoder_type": encoder_type,
+                "decoder_type": decoder_type,
                 "max_frames": max_frames,
                 "results": rows,
             },
@@ -310,6 +330,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--max-frames", type=int, default=None, help="0 or negative means full sample. Defaults to checkpoint config.")
     parser.add_argument("--encoder-type", default=None, choices=["non_snn", "nonsnn", "cnn_transformer", "snn"])
+    parser.add_argument(
+        "--decoder-type",
+        default=None,
+        choices=["siren", "wire", "finer", "dual", "dual_wrap", "wrap_siren", "wrap_fisin", "wrap", "wrap_wire", "wrap_fiwi"],
+        help="Defaults to checkpoint config.",
+    )
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--force-full-frame", default=None, action=argparse.BooleanOptionalAction)
     parser.add_argument("--disable-fallback", default=None, action=argparse.BooleanOptionalAction)
