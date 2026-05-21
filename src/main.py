@@ -3,13 +3,15 @@ main.py
 =======
 Entry point for the modular silent-video-to-mel reconstruction pipeline.
 Supports full CLI arguments for easy configuration, direct end-to-end training,
-and seamless switching between encoder and decoder types.
+seamless switching between encoder and decoder types, multi-GPU training (nn.DataParallel),
+and gradient accumulation to prevent VRAM OOM errors.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import gc
 import json
 import argparse
 import random
@@ -72,8 +74,11 @@ def seed_everything(seed: int) -> None:
 def reset_snn_if_needed(module: torch.nn.Module, encoder_type: str) -> None:
     if encoder_type != "snn":
         return
-    from spikingjelly.activation_based import functional
-    functional.reset_net(module)
+    try:
+        from spikingjelly.activation_based import functional
+        functional.reset_net(module)
+    except ImportError:
+        pass
 
 
 def build_base_decoder(decoder_type: str):
@@ -172,6 +177,13 @@ def save_mel_plot(pred_mel: torch.Tensor, target_mel: torch.Tensor, output_path:
     plt.close(fig)
 
 
+def get_state_dict(model: torch.nn.Module) -> dict:
+    """Unwrap DataParallel model before extracting state_dict to keep checkpoints clean."""
+    if isinstance(model, torch.nn.DataParallel):
+        return model.module.state_dict()
+    return model.state_dict()
+
+
 def save_checkpoint(
     path: Path,
     encoder: torch.nn.Module,
@@ -191,8 +203,8 @@ def save_checkpoint(
             "train_loss": train_loss,
             "val_loss": val_loss,
             "best_val_loss": best_val_loss,
-            "encoder_state_dict": encoder.state_dict(),
-            "decoder_state_dict": decoder.state_dict(),
+            "encoder_state_dict": get_state_dict(encoder),
+            "decoder_state_dict": get_state_dict(decoder),
             "optimizer_state_dict": optimizer.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
             "config": vars(args),
@@ -210,8 +222,14 @@ def load_resume(
     device: torch.device,
 ) -> tuple[int, float]:
     ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-    encoder.load_state_dict(ckpt["encoder_state_dict"], strict=True)
-    decoder.load_state_dict(ckpt["decoder_state_dict"], strict=True)
+    
+    # Resolve underlying modules if using nn.DataParallel
+    enc_module = encoder.module if isinstance(encoder, torch.nn.DataParallel) else encoder
+    dec_module = decoder.module if isinstance(decoder, torch.nn.DataParallel) else decoder
+
+    enc_module.load_state_dict(ckpt["encoder_state_dict"], strict=True)
+    dec_module.load_state_dict(ckpt["decoder_state_dict"], strict=True)
+    
     if "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     if "scaler_state_dict" in ckpt:
@@ -236,10 +254,12 @@ def train_one_epoch(
     amp_enabled = device.type == "cuda" and args.amp
     total_loss = 0.0
     num_batches = 0
+    accum_steps = max(1, args.accum_steps)
 
-    for batch in tqdm(loader, desc="train", leave=False):
+    optimizer.zero_grad(set_to_none=True)
+
+    for batch_idx, batch in enumerate(tqdm(loader, desc="train", leave=False)):
         video, landmarks, target, lengths, _ = unpack_batch(batch, device)
-        optimizer.zero_grad(set_to_none=True)
         reset_snn_if_needed(encoder, args.encoder_type)
 
         with torch.amp.autocast("cuda", enabled=amp_enabled):
@@ -248,22 +268,29 @@ def train_one_epoch(
 
         with torch.amp.autocast("cuda", enabled=False):
             loss = criterion(pred.float(), target.float(), lengths)
+            # Scale loss to support gradient accumulation
+            loss = loss / accum_steps
 
         if not torch.isfinite(loss):
-            raise FloatingPointError(f"Non-finite train loss: {float(loss.detach().cpu())}")
+            raise FloatingPointError(f"Non-finite train loss: {float(loss.detach().cpu()) * accum_steps}")
 
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        if args.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                list(encoder.parameters()) + list(decoder.parameters()),
-                args.max_grad_norm,
-            )
-        scaler.step(optimizer)
-        scaler.update()
+
+        # Step weights only after accumulating gradients for configured steps
+        if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(loader):
+            scaler.unscale_(optimizer)
+            if args.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    list(encoder.parameters()) + list(decoder.parameters()),
+                    args.max_grad_norm,
+                )
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
         reset_snn_if_needed(encoder, args.encoder_type)
 
-        total_loss += float(loss.detach().cpu())
+        total_loss += float(loss.detach().cpu()) * accum_steps
         num_batches += 1
 
     if num_batches == 0:
@@ -384,6 +411,12 @@ def run(args: argparse.Namespace) -> None:
     encoder, decoder = build_models(device, args.encoder_type, args.decoder_type, dataset.landmark_num_points)
     criterion = make_criterion(args, device)
 
+    # Wrap model in nn.DataParallel to utilize all available GPUs
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"[device] Found {torch.cuda.device_count()} GPUs. Wrapping modules in nn.DataParallel!")
+        encoder = torch.nn.DataParallel(encoder)
+        decoder = torch.nn.DataParallel(decoder)
+
     # Implement parameter groups learning rate split from the optimization plan:
     # Scale learning rate up for discrete SNN gradients, scale down for sensitive FINER decoders.
     is_snn = args.encoder_type.lower() == "snn"
@@ -411,6 +444,8 @@ def run(args: argparse.Namespace) -> None:
         print(f"[resume] {safe_text(resume_path)} -> start_epoch={start_epoch}")
 
     print(f"[device] {device}")
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"[device] Multi-GPU Active: {torch.cuda.device_count()}x GPUs utilized.")
     print(f"[data] {safe_text(resolve_path(args.data_dir))}")
     print(f"[split] train={train_count} val={val_count}")
     print(f"[model] encoder={args.encoder_type} decoder={args.decoder_type} landmarks={dataset.landmark_num_points}")
@@ -422,6 +457,7 @@ def run(args: argparse.Namespace) -> None:
             args.lambda_energy,
         )
     )
+    print(f"[optim] accum_steps={args.accum_steps} batch_size={args.batch_size} effective_batch_size={args.batch_size * args.accum_steps}")
 
     history = []
     for epoch in range(start_epoch, args.epochs + 1):
@@ -495,6 +531,11 @@ def run(args: argparse.Namespace) -> None:
                 args,
             )
 
+        # Clear VRAM cache actively at the end of each epoch to prevent leakage OOM
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+
         row = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "best": best_val_loss}
         history.append(row)
         with open(output_dir / "history.json", "w", encoding="utf-8") as f:
@@ -539,6 +580,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--accum-steps", type=int, default=1, help="Number of steps for gradient accumulation.")
     parser.add_argument("--force-full-frame", action="store_true")
     parser.add_argument("--disable-fallback", action="store_true")
     return parser.parse_args()
