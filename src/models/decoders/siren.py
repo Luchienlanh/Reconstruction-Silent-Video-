@@ -12,7 +12,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
-from .base_layers import FiLMLayer
 
 class FiLMSIREN(nn.Module):
     def __init__(self, in_features, out_features, omega_zero=30.0, is_first=False):

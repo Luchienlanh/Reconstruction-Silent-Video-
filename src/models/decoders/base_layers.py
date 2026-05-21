@@ -11,7 +11,8 @@ from torch import Tensor
 import torch.nn as nn
 from .siren import FiLMSIREN
 from .wire import FiLMWIRE
-from .finer import FiLMWrapFINSIREN, FiLMWrapFINWIRE
+from .finer import TFiLMFINERDecoder
+from .wrap import FiLMWrapFINSIREN, FiLMWrapFINWIRE
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
