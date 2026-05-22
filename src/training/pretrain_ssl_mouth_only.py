@@ -251,6 +251,9 @@ def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
                 v1 = aug(video)
                 v2 = aug(video)
                 loss = model(v1, v2)
+                # nn.DataParallel returns a vector of losses per GPU, take mean to get scalar
+                if loss.dim() > 0:
+                    loss = loss.mean()
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -259,7 +262,12 @@ def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-            model.update_target()
+            
+            # Handle DataParallel target update
+            if isinstance(model, nn.DataParallel):
+                model.module.update_target()
+            else:
+                model.update_target()
 
             total_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -270,9 +278,10 @@ def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
         # Save checkpoint
         if checkpoint_dir and (epoch % save_every == 0 or epoch == epochs):
             os.makedirs(checkpoint_dir, exist_ok=True)
+            raw_model = model.module if isinstance(model, nn.DataParallel) else model
             ckpt = {
                 'epoch': epoch,
-                'online_encoder_state_dict': model.online_encoder.state_dict(),
+                'online_encoder_state_dict': raw_model.online_encoder.state_dict(),
                 'loss': avg_loss,
                 'optimizer': optimizer.state_dict(),
             }
@@ -399,6 +408,9 @@ def main():
 
     # 3. BYOL model
     byol = BYOL(base_encoder, momentum=args.momentum).to(device)
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"[device] Found {torch.cuda.device_count()} GPUs. Wrapping BYOL in nn.DataParallel!")
+        byol = nn.DataParallel(byol)
 
     # 4. Optimizer
     optimizer = torch.optim.AdamW(byol.parameters(), lr=args.lr, weight_decay=args.weight_decay)
