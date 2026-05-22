@@ -29,7 +29,10 @@ class MelTemporalUpsampleDecoder(nn.Module):
     def forward(self, condition=None, target_len=None):
         # Handle empty sub-batches gracefully when using multi-GPU nn.DataParallel
         if condition is None or (torch.is_tensor(condition) and condition.shape[0] == 0):
-            device = next(self.parameters()).device
+            if torch.cuda.is_available():
+                device = torch.device("cuda", torch.cuda.current_device())
+            else:
+                device = torch.device("cpu")
             t_len = target_len if target_len is not None else 0
             return torch.empty(0, t_len, 80, device=device)
 
