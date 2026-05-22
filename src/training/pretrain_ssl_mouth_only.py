@@ -179,8 +179,11 @@ class FINERMouthINRDecoder(nn.Module):
         # Generates scale (gamma) and shift (beta) for all layers
         self.film_gen = nn.Linear(z_dim, num_layers * 2 * hidden_dim)
         with torch.no_grad():
-            # Initialize very small so that modulation starts as identity
-            self.film_gen.weight.data.normal_(0.0, 0.01)
+            # "Perfect Initialization": Initialize weight and bias to EXACTLY 0.0.
+            # This forces initial gammas and betas to be 0.0, making all reconstructed frames
+            # initially 100% identical. This zeroes out initial recon_motion and motion_ratio,
+            # allowing the network to focus on learning the average static mouth shape first.
+            self.film_gen.weight.data.zero_()
             self.film_gen.bias.data.zero_()
 
         # List of modulated FINER layers
@@ -196,7 +199,9 @@ class FINERMouthINRDecoder(nn.Module):
             )
 
         self.final_layer = nn.Linear(hidden_dim, out_channels)
-        nn.init.xavier_uniform_(self.final_layer.weight)
+        # Initialize with normal distribution (std=1e-2) to avoid high-frequency salt-and-pepper noise
+        # while keeping the gradient flow strong and stable.
+        nn.init.normal_(self.final_layer.weight, mean=0.0, std=1e-2)
         nn.init.zeros_(self.final_layer.bias)
         self.output_bias = nn.Parameter(torch.zeros(1))
 
