@@ -3,13 +3,6 @@ pretrain_byol_mouth.py
 ======================
 Bootstrap Your Own Latent (BYOL) pretraining for mouth video encoder (ResNet2+1D).
 No labels, no negative pairs, only relies on augmentations of the same clip.
-
-Usage examples:
-  # Full training
-  python pretrain_byol_mouth.py --data-dir Processed_Data_Mel_HiFiGAN --output-dir checkpoints_byol --epochs 50
-
-  # Overfit test with 1 sample
-  python pretrain_byol_mouth.py --data-dir Processed_Data_Mel_HiFiGAN --limit 1 --batch-size 1 --epochs 200 --output-dir overfit_test
 """
 
 import os
@@ -27,7 +20,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset, random_split
 from tqdm import tqdm
 
-# Add project paths (adjust as needed)
+# Add project paths
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent.parent
 if str(CURRENT_DIR) not in sys.path:
@@ -47,7 +40,7 @@ except ImportError:
 
 # ========== Fallback dataset (fixed index error) ==========
 class SimpleMouthDataset(Dataset):
-    """Load .pt files, crop mouth ROI, return video tensor (B,1,T,H_roi,W_roi)."""
+    """Load .pt files, crop mouth ROI, return video tensor (1, T, H_roi, W_roi)."""
     def __init__(self, data_dir, mouth_roi=(45,80,32,80), max_frames=30):
         self.data_dir = Path(data_dir)
         self.mouth_roi = mouth_roi
@@ -65,7 +58,6 @@ class SimpleMouthDataset(Dataset):
             video = video.unsqueeze(0)  # (1, T, H, W)
         # Crop mouth ROI: video shape (C, T, H, W)
         y1, y2, x1, x2 = self.mouth_roi
-        # Correct indexing: (channels, time, height, width)
         mouth = video[:, :, y1:y2, x1:x2]   # (1, T, H_roi, W_roi)
         T = mouth.shape[1]
         # Adjust temporal length
@@ -75,7 +67,6 @@ class SimpleMouthDataset(Dataset):
         elif T < self.max_frames:
             pad = self.max_frames - T
             mouth = F.pad(mouth, (0,0,0,0,0,pad,0,0))
-        # Output shape: (1, T, H_roi, W_roi) - will be stacked to (B,1,T,H,W)
         return mouth
 
     def __len__(self):
@@ -140,7 +131,7 @@ class BYOLProjector(nn.Module):
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, out_dim),
-            nn.BatchNorm1d(out_dim, affine=False)   # target uses no affine
+            nn.BatchNorm1d(out_dim, affine=False)
         )
     def forward(self, x):
         return self.net(x)
@@ -167,13 +158,12 @@ class BYOL(nn.Module):
         self.predictor = BYOLPredictor(projection_dim, hidden_dim, projection_dim)
         self.momentum = momentum
 
-        # Freeze target networks
         for p in self.target_encoder.parameters():
             p.requires_grad = False
         for p in self.target_projector.parameters():
             p.requires_grad = False
 
-        self._update_target(keep_online=True)  # init target = online
+        self._update_target(keep_online=True)
 
     @torch.no_grad()
     def _update_target(self, keep_online=False):
@@ -186,9 +176,7 @@ class BYOL(nn.Module):
                 param_online.requires_grad = True
 
     def forward(self, x1, x2):
-        # x1, x2: (B, 1, T, H, W)
-        # Encode and temporal pool
-        z1 = self.online_encoder(x1).mean(dim=1)   # (B, 512)
+        z1 = self.online_encoder(x1).mean(dim=1)
         z2 = self.online_encoder(x2).mean(dim=1)
         p1 = self.online_projector(z1)
         p2 = self.online_projector(z2)
@@ -222,7 +210,7 @@ def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
         total_loss = 0.0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
         for batch_idx, video in enumerate(pbar):
-            video = video.to(device, non_blocking=True)  # (B,1,T,H_roi,W_roi)
+            video = video.to(device, non_blocking=True)
             with torch.amp.autocast('cuda', enabled=amp and device.type=='cuda'):
                 v1 = aug(video)
                 v2 = aug(video)
@@ -268,29 +256,23 @@ def main():
                         help="Checkpoint output directory")
     parser.add_argument("--encoder-type", type=str, default="non_snn",
                         choices=["non_snn", "snn", "resnet18_temporal"],
-                        help="Backbone encoder type (must be (2+1)D)")
+                        help="Backbone encoder type")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--max-frames", type=int, default=30,
-                        help="Number of frames per clip")
+    parser.add_argument("--max-frames", type=int, default=30)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--momentum", type=float, default=0.996,
-                        help="Momentum for target network update")
-    parser.add_argument("--max-grad-norm", type=float, default=1.0,
-                        help="Gradient clipping norm. 0 to disable.")
+    parser.add_argument("--momentum", type=float, default=0.996)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--limit", type=int, default=None,
-                        help="Limit number of samples for dry-run / overfit test")
+    parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--amp", action="store_true", help="Enable mixed precision")
+    parser.add_argument("--amp", action="store_true")
     parser.add_argument("--mouth-roi", nargs=4, type=int, default=[45,80,32,80],
-                        metavar=("Y1","Y2","X1","X2"),
-                        help="Mouth crop coordinates in 112x112 frame")
+                        metavar=("Y1","Y2","X1","X2"))
     args = parser.parse_args()
 
-    # Set seed
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -303,7 +285,7 @@ def main():
 
     # 1. Dataset
     if USE_FACTORY:
-        # Use VNLipDatasetV2 but we only need video without landmarks/target
+        # Use VNLipDatasetV2 without landmarks/target
         base_ds = VNLipDatasetV2(
             data_dir=args.data_dir,
             max_frames=args.max_frames,
@@ -319,17 +301,27 @@ def main():
             def __len__(self):
                 return len(self.ds)
             def __getitem__(self, idx):
-                video, _, _ = self.ds[idx]  # (C, T, H, W)
+                # VNLipDatasetV2 returns (video, target) when use_landmarks=False? Let's handle both.
+                result = self.ds[idx]
+                if isinstance(result, tuple):
+                    if len(result) == 2:
+                        video, _ = result
+                    elif len(result) == 3:
+                        video, _, _ = result
+                    else:
+                        raise ValueError(f"Unexpected tuple length: {len(result)}")
+                else:
+                    video = result
+                # video shape: (C, T, H, W)
                 y1,y2,x1,x2 = self.roi
                 mouth = video[:, :, y1:y2, x1:x2]
                 return mouth
         dataset = MouthWrapper(base_ds, tuple(args.mouth_roi))
-        collate_fn = lambda batch: torch.stack(batch, dim=0)  # simple stacking
+        collate_fn = lambda batch: torch.stack(batch, dim=0)
     else:
         dataset = SimpleMouthDataset(args.data_dir, tuple(args.mouth_roi), args.max_frames)
         collate_fn = collate_byol
 
-    # Apply limit using Subset (same as original script)
     if args.limit:
         limit = max(1, min(int(args.limit), len(dataset)))
         dataset = Subset(dataset, list(range(limit)))
@@ -345,12 +337,10 @@ def main():
     )
     print(f"Dataset size: {len(dataset)}")
 
-    # 2. Build base encoder (ResNet2+1D)
+    # 2. Build base encoder
     if USE_FACTORY:
         base_encoder = build_encoder(args.encoder_type).to(device)
     else:
-        # If build_encoder not available, you must define your (2+1)D encoder here.
-        # For this example, we raise error.
         raise ImportError("build_encoder not found. Please implement your ResNet2+1D encoder.")
     print(f"Base encoder: {args.encoder_type}")
 
@@ -373,7 +363,7 @@ def main():
         amp=args.amp,
     )
 
-    # 6. Save final encoder only (for downstream tasks)
+    # 6. Save final encoder only
     final_path = os.path.join(args.output_dir, "pretrained_encoder_resnet2plus1d.pth")
     torch.save(pretrained_encoder.state_dict(), final_path)
     print(f"Pretrained encoder saved to {final_path}")
