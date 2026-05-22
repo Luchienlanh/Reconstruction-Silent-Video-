@@ -446,34 +446,6 @@ def run(args: argparse.Namespace) -> None:
 
     dataset, train_loader, val_loader, train_count, val_count = create_loaders(args)
     encoder, decoder = build_models(device, args.encoder_type, args.decoder_type, dataset.landmark_num_points)
-    
-    # Load Pre-trained SSL Weights if specified
-    if getattr(args, "pretrained_ssl", None) is not None:
-        pretrained_ssl_path = resolve_path(args.pretrained_ssl)
-        if pretrained_ssl_path and pretrained_ssl_path.is_file():
-            print(f"[pretrained-ssl] Loading weights from {safe_text(pretrained_ssl_path)}")
-            checkpoint = torch.load(pretrained_ssl_path, map_location=device, weights_only=False)
-            
-            # Check if checkpoint is the dict saved by pretrain_ssl.py
-            if isinstance(checkpoint, dict) and "backbone" in checkpoint:
-                state_dict = checkpoint["backbone"]
-            else:
-                state_dict = checkpoint
-            
-            # Target the backbone inside VisualLandmarkEncoderV2 -> ViTEncoder
-            # encoder.visual_encoder.backbone
-            if hasattr(encoder, "visual_encoder") and hasattr(encoder.visual_encoder, "backbone"):
-                missing_keys, unexpected_keys = encoder.visual_encoder.backbone.load_state_dict(state_dict, strict=False)
-                print(f"[pretrained-ssl] Backbone loaded successfully!")
-                if len(missing_keys) > 0:
-                    print(f"[pretrained-ssl] Missing keys (first 5): {missing_keys[:5]}")
-                if len(unexpected_keys) > 0:
-                    print(f"[pretrained-ssl] Unexpected keys (first 5): {unexpected_keys[:5]}")
-            else:
-                print("[pretrained-ssl] WARNING: Could not locate visual_encoder.backbone in encoder!")
-        else:
-            print(f"[pretrained-ssl] WARNING: Pretrained SSL path {args.pretrained_ssl} does not exist or is not a file!")
-
     criterion = make_criterion(args, device)
 
     # Wrap model in nn.DataParallel to utilize all available GPUs
@@ -702,7 +674,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-scheduler", default="constant", choices=["constant", "onecycle", "cosine"], help="Learning rate scheduler type.")
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Number of warmup epochs for cosine scheduler.")
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning (progressive max_frames).")
-    parser.add_argument("--pretrained-ssl", default=None, help="Path to self-supervised pre-trained backbone checkpoint.")
     return parser.parse_args()
 
 

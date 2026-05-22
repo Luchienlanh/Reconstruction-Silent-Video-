@@ -82,39 +82,6 @@ def reset_snn_if_needed(module: torch.nn.Module, encoder_type: str) -> None:
         pass
 
 
-def get_curriculum_frames(epoch: int, total_epochs: int, target_max_frames: int) -> int:
-    """
-    Calculate the max_frames for curriculum learning based on current epoch.
-    Instead of a step function, uses a smooth linear progression from 40% to 100%
-    over the first 75% of epochs, and holds at 100% for the remaining 25% of epochs.
-    Ensures active max_frames increases smoothly almost every epoch.
-    """
-    if epoch <= 0:
-        return target_max_frames
-    
-    ramp_end_pct = 0.75
-    pct = epoch / total_epochs
-    
-    if pct >= ramp_end_pct:
-        factor = 1.0
-    else:
-        start_factor = 0.40
-        end_factor = 1.00
-        factor = start_factor + (end_factor - start_factor) * (pct / ramp_end_pct)
-        
-    frames = int(round(target_max_frames * factor))
-    min_allowed = min(15, target_max_frames)
-    return max(min_allowed, frames)
-
-
-def set_dataset_max_frames(dataset, max_frames: Optional[int]) -> None:
-    """Recursively unwrap Subsets to find the actual dataset and set max_frames."""
-    if hasattr(dataset, "dataset"):
-        set_dataset_max_frames(dataset.dataset, max_frames)
-    elif hasattr(dataset, "max_frames"):
-        dataset.max_frames = max_frames
-
-
 def build_base_decoder(decoder_type: str):
     decoder_type = decoder_type.lower()
     common = dict(hidden_dim=256, out_dim=80, num_layers=4, use_conv=True)
@@ -446,34 +413,6 @@ def run(args: argparse.Namespace) -> None:
 
     dataset, train_loader, val_loader, train_count, val_count = create_loaders(args)
     encoder, decoder = build_models(device, args.encoder_type, args.decoder_type, dataset.landmark_num_points)
-    
-    # Load Pre-trained SSL Weights if specified
-    if getattr(args, "pretrained_ssl", None) is not None:
-        pretrained_ssl_path = resolve_path(args.pretrained_ssl)
-        if pretrained_ssl_path and pretrained_ssl_path.is_file():
-            print(f"[pretrained-ssl] Loading weights from {safe_text(pretrained_ssl_path)}")
-            checkpoint = torch.load(pretrained_ssl_path, map_location=device, weights_only=False)
-            
-            # Check if checkpoint is the dict saved by pretrain_ssl.py
-            if isinstance(checkpoint, dict) and "backbone" in checkpoint:
-                state_dict = checkpoint["backbone"]
-            else:
-                state_dict = checkpoint
-            
-            # Target the backbone inside VisualLandmarkEncoderV2 -> ViTEncoder
-            # encoder.visual_encoder.backbone
-            if hasattr(encoder, "visual_encoder") and hasattr(encoder.visual_encoder, "backbone"):
-                missing_keys, unexpected_keys = encoder.visual_encoder.backbone.load_state_dict(state_dict, strict=False)
-                print(f"[pretrained-ssl] Backbone loaded successfully!")
-                if len(missing_keys) > 0:
-                    print(f"[pretrained-ssl] Missing keys (first 5): {missing_keys[:5]}")
-                if len(unexpected_keys) > 0:
-                    print(f"[pretrained-ssl] Unexpected keys (first 5): {unexpected_keys[:5]}")
-            else:
-                print("[pretrained-ssl] WARNING: Could not locate visual_encoder.backbone in encoder!")
-        else:
-            print(f"[pretrained-ssl] WARNING: Pretrained SSL path {args.pretrained_ssl} does not exist or is not a file!")
-
     criterion = make_criterion(args, device)
 
     # Wrap model in nn.DataParallel to utilize all available GPUs
@@ -554,16 +493,8 @@ def run(args: argparse.Namespace) -> None:
     )
     print(f"[optim] accum_steps={args.accum_steps} batch_size={args.batch_size} effective_batch_size={args.batch_size * args.accum_steps}")
 
-    target_max_frames = args.max_frames
-
     history = []
     for epoch in range(start_epoch, args.epochs + 1):
-        if args.curriculum:
-            current_frames = get_curriculum_frames(epoch, args.epochs, target_max_frames)
-            set_dataset_max_frames(dataset, current_frames)
-            set_dataset_max_frames(train_loader.dataset, current_frames)
-            print(f"[curriculum] Epoch {epoch:04d} -> active max_frames={current_frames}")
-
         train_loss = train_one_epoch(
             encoder=encoder,
             decoder=decoder,
@@ -575,12 +506,6 @@ def run(args: argparse.Namespace) -> None:
             args=args,
             scheduler=scheduler,
         )
-
-        if args.curriculum:
-            # Restore target_max_frames for validation / standard evaluation
-            set_dataset_max_frames(dataset, target_max_frames)
-            if val_loader is not None:
-                set_dataset_max_frames(val_loader.dataset, target_max_frames)
 
         val_loss = None
         if val_loader is not None and (epoch % args.val_every == 0 or epoch == args.epochs):
@@ -701,8 +626,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-fallback", action="store_true")
     parser.add_argument("--lr-scheduler", default="constant", choices=["constant", "onecycle", "cosine"], help="Learning rate scheduler type.")
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Number of warmup epochs for cosine scheduler.")
-    parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning (progressive max_frames).")
-    parser.add_argument("--pretrained-ssl", default=None, help="Path to self-supervised pre-trained backbone checkpoint.")
     return parser.parse_args()
 
 

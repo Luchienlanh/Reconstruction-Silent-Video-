@@ -139,36 +139,24 @@ class LandmarkEncoderV2(nn.Module):
         return self.net(x)
 
 class VisualLandmarkEncoderV2(nn.Module):
-    """Fuse the visual encoder with 6-dim landmark dynamics before the mel decoder using Multi-Head Cross-Attention."""
+    """Fuse the visual encoder with 6-dim landmark dynamics before the mel decoder."""
 
-    def __init__(self, visual_encoder: nn.Module, num_landmark_points: int, z_dim: int = 512, num_heads: int = 8, dropout: float = 0.1):
+    def __init__(self, visual_encoder: nn.Module, num_landmark_points: int, z_dim: int = 512):
         super().__init__()
         self.visual_encoder = visual_encoder
         self.landmark_encoder = LandmarkEncoderV2(num_landmark_points, out_dim=z_dim)
-        
-        # Multi-Head Cross-Attention where Query is Video, Key and Value are Landmark features.
-        self.cross_attn = nn.MultiheadAttention(embed_dim=z_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
-        
-        # Layer normalization and residual paths
-        self.norm1 = nn.LayerNorm(z_dim)
-        self.norm2 = nn.LayerNorm(z_dim)
-        
-        # Feed-forward network (FFN)
-        self.ffn = nn.Sequential(
-            nn.Linear(z_dim, z_dim * 2),
-            nn.SiLU(),
-            nn.Dropout(dropout),
+        self.fusion = nn.Sequential(
             nn.Linear(z_dim * 2, z_dim),
-            nn.Dropout(dropout),
+            nn.LayerNorm(z_dim),
+            nn.SiLU(),
+            nn.Linear(z_dim, z_dim),
         )
 
     def forward(self, video: torch.Tensor, landmarks: torch.Tensor = None) -> torch.Tensor:
         if landmarks is None:
             raise ValueError("VisualLandmarkEncoderV2 requires landmarks (B, T, N, 6).")
-        
-        z_video = self.visual_encoder(video)       # (B, T_video, z_dim)
-        z_landmark = self.landmark_encoder(landmarks)  # (B, T_landmark, z_dim)
-        
+        z_video = self.visual_encoder(video)       # (B, T, z_dim)
+        z_landmark = self.landmark_encoder(landmarks)  # (B, T, z_dim)
         # Align temporal dimensions if needed
         if z_landmark.shape[1] != z_video.shape[1]:
             z_landmark = F.interpolate(
@@ -177,21 +165,5 @@ class VisualLandmarkEncoderV2(nn.Module):
                 mode="linear",
                 align_corners=False,
             ).transpose(1, 2).contiguous()
-            
-        # Cross-Attention: Query = z_video, Key = z_landmark, Value = z_landmark
-        # attn_out: (B, T_video, z_dim)
-        attn_out, _ = self.cross_attn(
-            query=z_video,
-            key=z_landmark,
-            value=z_landmark,
-        )
-        
-        # Residual Connection 1 + Norm 1 (Add & Norm)
-        x = self.norm1(z_video + attn_out)
-        
-        # Feed-Forward + Residual Connection 2 + Norm 2
-        ffn_out = self.ffn(x)
-        out = self.norm2(x + ffn_out)
-        
-        return out
+        return self.fusion(torch.cat([z_video, z_landmark], dim=-1))
 

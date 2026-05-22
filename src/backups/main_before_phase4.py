@@ -1,12 +1,6 @@
 """
-main.py
-=======
-Entry point for the modular silent-video-to-mel reconstruction pipeline.
-Supports full CLI arguments for easy configuration, direct end-to-end training,
-seamless switching between encoder and decoder types, multi-GPU training (nn.DataParallel),
-and gradient accumulation to prevent VRAM OOM errors.
+main.py (Backup before Phase 4 SSL fixes)
 """
-
 from __future__ import annotations
 
 import os
