@@ -171,13 +171,25 @@ class FINERMouthINRDecoder(nn.Module):
         self.latent_proj = nn.Sequential(
             nn.LayerNorm(z_dim),
             nn.Linear(z_dim, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
         )
-        nn.init.normal_(self.latent_proj[-1].weight, mean=0.0, std=1e-3)
-        nn.init.zeros_(self.latent_proj[-1].bias)
+        self.fuse = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.SiLU(inplace=True),
+        )
+
+        nn.init.xavier_uniform_(self.coord_proj.weight)
+        nn.init.zeros_(self.coord_proj.bias)
+        for module in list(self.latent_proj.modules()) + list(self.fuse.modules()):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
 
         self.finer_layers = nn.ModuleList()
         self.finer_layers.append(
-            FINERLayer(in_features=hidden_dim, out_features=hidden_dim, omega_zero=omega_zero, is_first=True)
+            FINERLayer(in_features=hidden_dim, out_features=hidden_dim, omega_zero=omega_zero, is_first=False)
         )
         for _ in range(1, num_layers):
             self.finer_layers.append(
@@ -185,7 +197,7 @@ class FINERMouthINRDecoder(nn.Module):
             )
 
         self.final_layer = nn.Linear(hidden_dim, out_channels)
-        nn.init.normal_(self.final_layer.weight, mean=0.0, std=1e-4)
+        nn.init.xavier_uniform_(self.final_layer.weight, gain=0.5)
         nn.init.zeros_(self.final_layer.bias)
         self.output_bias = nn.Parameter(torch.zeros(1))
 
@@ -203,9 +215,9 @@ class FINERMouthINRDecoder(nn.Module):
 
         z_flat = z.reshape(b * t, -1)
         coords = self._coords(z.device, z.dtype)  # (H*W, 2)
-        coord_features = self.coord_proj(coords).unsqueeze(0)
-        latent_features = self.latent_proj(z_flat).unsqueeze(1)
-        x = coord_features + latent_features
+        coord_features = self.coord_proj(coords).unsqueeze(0).expand(b * t, -1, -1)
+        latent_features = self.latent_proj(z_flat).unsqueeze(1).expand(-1, h * w, -1)
+        x = self.fuse(torch.cat([coord_features, latent_features], dim=-1))
 
         for layer in self.finer_layers:
             x = layer(x)
@@ -350,6 +362,9 @@ def compute_reconstruction_metrics(
 ) -> dict[str, torch.Tensor]:
     loss_l1 = F.l1_loss(mouth_recon, mouth_gt)
     loss_mse = F.mse_loss(mouth_recon, mouth_gt)
+    mean_baseline_l1 = F.l1_loss(torch.full_like(mouth_gt, mouth_gt.mean().detach()), mouth_gt)
+    gt_std = mouth_gt.std(unbiased=False)
+    recon_std = mouth_recon.std(unbiased=False)
 
     if mouth_gt.shape[2] > 1:
         diff_gt = mouth_gt[:, :, 1:] - mouth_gt[:, :, :-1]
@@ -383,6 +398,9 @@ def compute_reconstruction_metrics(
         "loss": loss,
         "l1": loss_l1,
         "mse": loss_mse,
+        "mean_l1": mean_baseline_l1,
+        "gt_std": gt_std,
+        "recon_std": recon_std,
         "temporal": loss_temporal,
         "edge": loss_edge,
         "motion_mag": loss_motion_mag,
@@ -473,6 +491,9 @@ def train_one_epoch(
         "loss": 0.0,
         "l1": 0.0,
         "mse": 0.0,
+        "mean_l1": 0.0,
+        "gt_std": 0.0,
+        "recon_std": 0.0,
         "temporal": 0.0,
         "edge": 0.0,
         "motion_mag": 0.0,
@@ -528,6 +549,8 @@ def train_one_epoch(
             pbar.set_postfix(
                 loss=f"{float(metrics['loss'].detach().cpu()):.5f}",
                 l1=f"{float(metrics['l1'].detach().cpu()):.5f}",
+                mean=f"{float(metrics['mean_l1'].detach().cpu()):.5f}",
+                std=f"{float(metrics['recon_std'].detach().cpu()):.4f}",
                 motion=f"{float(metrics['motion_ratio'].detach().cpu()):.3f}",
             )
 
@@ -597,6 +620,9 @@ def evaluate(
         "loss": 0.0,
         "l1": 0.0,
         "mse": 0.0,
+        "mean_l1": 0.0,
+        "gt_std": 0.0,
+        "recon_std": 0.0,
         "temporal": 0.0,
         "edge": 0.0,
         "motion_mag": 0.0,
@@ -637,6 +663,8 @@ def evaluate(
         pbar.set_postfix(
             loss=f"{float(metrics['loss']):.5f}",
             l1=f"{float(metrics['l1']):.5f}",
+            mean=f"{float(metrics['mean_l1']):.5f}",
+            std=f"{float(metrics['recon_std']):.4f}",
             motion=f"{float(metrics['motion_ratio']):.3f}",
         )
 
@@ -762,7 +790,9 @@ def main(args: argparse.Namespace) -> None:
         optimizer_groups.append({"params": encoder_params, "lr": encoder_lr})
     optimizer_groups.append({"params": optim_model.decoder.parameters(), "lr": decoder_lr})
     optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    scheduler = None
+    if args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and args.amp)
 
     # 4. Training Loop
@@ -824,21 +854,25 @@ def main(args: argparse.Namespace) -> None:
                 mask_fill=args.mask_fill,
             )
 
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
         elapsed = time.time() - epoch_start
+        current_lr = scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
         
         train_loss_value = train_loss["loss"]
         val_loss_value = val_metrics["loss"] if val_metrics is not None else None
         val_text = f"{val_loss_value:.6f}" if val_loss_value is not None else "n/a"
         print(
             f"[epoch {epoch:03d}] train={train_loss_value:.6f} val={val_text} "
-            f"train_l1={train_loss['l1']:.5f} train_motion={train_loss['motion_ratio']:.3f} "
+            f"train_l1={train_loss['l1']:.5f} mean_l1={train_loss['mean_l1']:.5f} "
+            f"recon_std={train_loss['recon_std']:.5f} train_motion={train_loss['motion_ratio']:.3f} "
             f"gt_motion={train_loss['gt_motion']:.5f} recon_motion={train_loss['recon_motion']:.5f} "
-            f"| time={elapsed:.1f}s | lr={scheduler.get_last_lr()[0]:.2e}"
+            f"| time={elapsed:.1f}s | lr={current_lr:.2e}"
         )
         if val_metrics is not None:
             print(
-                f"  [val-metrics] l1={val_metrics['l1']:.5f} temporal={val_metrics['temporal']:.5f} "
+                f"  [val-metrics] l1={val_metrics['l1']:.5f} mean_l1={val_metrics['mean_l1']:.5f} "
+                f"recon_std={val_metrics['recon_std']:.5f} temporal={val_metrics['temporal']:.5f} "
                 f"edge={val_metrics['edge']:.5f} motion_mag={val_metrics['motion_mag']:.5f} "
                 f"tv={val_metrics['tv']:.5f} motion_ratio={val_metrics['motion_ratio']:.3f}"
             )
@@ -894,6 +928,7 @@ if __name__ == "__main__":
     parser.add_argument("--encoder-lr", type=float, default=1e-4, help="Learning rate for the visual encoder.")
     parser.add_argument("--decoder-lr", type=float, default=1e-4, help="Learning rate for the SSL mouth decoder.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay.")
+    parser.add_argument("--scheduler", default="cosine", choices=["cosine", "none"], help="LR scheduler. Use 'none' for overfit/debug runs.")
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping norm. Use 0 to disable.")
     parser.add_argument("--max-frames", type=int, default=60, help="Maximum video frames per sample.")
     parser.add_argument("--random-crop", default=True, action=argparse.BooleanOptionalAction, help="Randomly crop temporal windows when video_len > max_frames.")
