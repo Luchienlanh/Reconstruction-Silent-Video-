@@ -39,7 +39,6 @@ except ImportError:
 
 # ========== Fallback dataset ==========
 class SimpleMouthDataset(Dataset):
-    """Load .pt files, crop mouth ROI, return video tensor (1, T, H_roi, W_roi)."""
     def __init__(self, data_dir, mouth_roi=(45,80,32,80), max_frames=30):
         self.data_dir = Path(data_dir)
         self.mouth_roi = mouth_roi
@@ -72,11 +71,10 @@ class SimpleMouthDataset(Dataset):
         return self._load_video(self.files[idx])
 
 def collate_byol(batch):
-    """batch: list of (1, T, H, W) -> (B, 1, T, H, W)"""
     return torch.stack(batch, dim=0)
 
 
-# ========== Augmentations for mouth videos ==========
+# ========== Augmentations ==========
 class RandomBrightness(nn.Module):
     def __init__(self, strength=0.1):
         super().__init__()
@@ -118,7 +116,7 @@ def get_byol_augmentation():
     )
 
 
-# ========== BYOL components (LayerNorm for batch_size=1) ==========
+# ========== BYOL components ==========
 class BYOLProjector(nn.Module):
     def __init__(self, in_dim=512, hidden_dim=4096, out_dim=256):
         super().__init__()
@@ -194,12 +192,8 @@ class BYOL(nn.Module):
         self._update_target()
 
 
-# ========== Visualization helper ==========
+# ========== Visualization ==========
 def save_mouth_samples(original, view1, view2, output_path, epoch, max_samples=4):
-    """
-    Save mouth ROI samples: original, view1 (aug1), view2 (aug2)
-    original, view1, view2: (B,1,T,H,W) tensors on CPU
-    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -227,7 +221,7 @@ def save_mouth_samples(original, view1, view2, output_path, epoch, max_samples=4
     plt.close()
 
 
-# ========== Training loop ==========
+# ========== Training ==========
 def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
                checkpoint_dir=None, save_every=5, save_images_every=5, amp=False):
     model.train()
@@ -235,7 +229,7 @@ def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
     scaler = torch.amp.GradScaler('cuda', enabled=amp and device.type=='cuda')
     best_loss = float('inf')
 
-    # Save initial samples (epoch 0)
+    # Save initial samples
     if save_images_every > 0 and checkpoint_dir:
         try:
             sample_batch = next(iter(dataloader))
@@ -273,7 +267,7 @@ def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch:3d} | Loss: {avg_loss:.6f}")
 
-        # Save model checkpoint
+        # Save checkpoint
         if checkpoint_dir and (epoch % save_every == 0 or epoch == epochs):
             os.makedirs(checkpoint_dir, exist_ok=True)
             ckpt = {
@@ -353,9 +347,10 @@ def main():
             enable_fallback=True,
         )
         class MouthWrapper(Dataset):
-            def __init__(self, ds, roi):
+            def __init__(self, ds, roi, max_frames):
                 self.ds = ds
                 self.roi = roi
+                self.max_frames = max_frames
             def __len__(self):
                 return len(self.ds)
             def __getitem__(self, idx):
@@ -365,9 +360,16 @@ def main():
                 else:
                     video = result
                 y1,y2,x1,x2 = self.roi
-                mouth = video[:, :, y1:y2, x1:x2]
+                mouth = video[:, :, y1:y2, x1:x2]  # (C, T, H, W)
+                T = mouth.shape[1]
+                if T > self.max_frames:
+                    start = random.randint(0, T - self.max_frames)
+                    mouth = mouth[:, start:start+self.max_frames]
+                elif T < self.max_frames:
+                    pad = self.max_frames - T
+                    mouth = F.pad(mouth, (0,0,0,0,0,pad,0,0))
                 return mouth
-        dataset = MouthWrapper(base_ds, tuple(args.mouth_roi))
+        dataset = MouthWrapper(base_ds, tuple(args.mouth_roi), args.max_frames)
         collate_fn = lambda batch: torch.stack(batch, dim=0)
     else:
         dataset = SimpleMouthDataset(args.data_dir, tuple(args.mouth_roi), args.max_frames)
