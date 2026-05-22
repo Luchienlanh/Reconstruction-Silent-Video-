@@ -124,28 +124,40 @@ class FINERLayer(nn.Module):
         self.linear = nn.Linear(in_features, out_features)
         self.omega_zero = omega_zero
         self.is_first = is_first
+        self.init_weights()
+
+    def init_weights(self):
         with torch.no_grad():
-            if is_first:
-                bound = 1.0 / in_features
+            if self.is_first:
+                # First layer maps low-dim coordinates, weight bound should be 1 / in_features
+                bound = 1.0 / self.linear.in_features
             else:
-                bound = float(torch.sqrt(torch.tensor(6.0 / in_features)) / omega_zero)
+                # Subsequent layers map high-dim features
+                bound = float(torch.sqrt(torch.tensor(6.0 / self.linear.in_features)) / self.omega_zero)
             self.linear.weight.uniform_(-bound, bound)
             nn.init.zeros_(self.linear.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
         out_dtype = x.dtype
         x = self.linear(x)
-        if not self.is_first:
-            x = self.omega_zero * x
-        phase = self.omega_zero * (torch.abs(x.float()) + 1.0) * x.float()
+        
+        # Apply FiLM modulation: (1 + gamma) * x + beta
+        # gamma is initialized around 0, so 1 + gamma starts around 1.0
+        modulated = (1.0 + gamma.float()) * x.float() + beta.float()
+        
+        # Multiply omega_zero exactly once!
+        modulated = self.omega_zero * modulated
+        
+        # FINER variable-periodic activation function: sin((|modulated| + 1) * modulated)
+        phase = (torch.abs(modulated) + 1.0) * modulated
         phase = torch.nan_to_num(phase, nan=0.0, posinf=1000.0, neginf=-1000.0).clamp(-1000.0, 1000.0)
         return torch.sin(phase).to(dtype=out_dtype)
 
 
 class FINERMouthINRDecoder(nn.Module):
     """
-    SSL-only coordinate decoder for mouth patches.
-    It learns a continuous image function f(z_t, x, y) -> pixel intensity.
+    SSL-only coordinate decoder for mouth patches using FiLM-modulated FINER.
+    It learns a continuous coordinate function: f(z_t, x, y) -> pixel intensity.
     """
     def __init__(
         self,
@@ -161,15 +173,28 @@ class FINERMouthINRDecoder(nn.Module):
         self.out_channels = out_channels
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.omega_zero = omega_zero
 
-        self.coord_in = nn.Linear(2, hidden_dim)
-        self.latent_in = nn.Linear(z_dim, hidden_dim)
-        self.finer_layers = nn.ModuleList(
-            [
-                FINERLayer(hidden_dim, hidden_dim, omega_zero=omega_zero, is_first=(idx == 0))
-                for idx in range(num_layers)
-            ]
+        # FiLM parameter generator from latent code z_t
+        # Generates scale (gamma) and shift (beta) for all layers
+        self.film_gen = nn.Linear(z_dim, num_layers * 2 * hidden_dim)
+        with torch.no_grad():
+            # Initialize very small so that modulation starts as identity
+            self.film_gen.weight.data.normal_(0.0, 0.01)
+            self.film_gen.bias.data.zero_()
+
+        # List of modulated FINER layers
+        self.finer_layers = nn.ModuleList()
+        # The first layer takes spatial coordinates (x, y)
+        self.finer_layers.append(
+            FINERLayer(in_features=2, out_features=hidden_dim, omega_zero=omega_zero, is_first=True)
         )
+        # Subsequent layers map high-dim features
+        for _ in range(1, num_layers):
+            self.finer_layers.append(
+                FINERLayer(in_features=hidden_dim, out_features=hidden_dim, omega_zero=omega_zero, is_first=False)
+            )
+
         self.final_layer = nn.Linear(hidden_dim, out_channels)
         nn.init.normal_(self.final_layer.weight, mean=0.0, std=1e-4)
         nn.init.zeros_(self.final_layer.bias)
@@ -183,20 +208,35 @@ class FINERMouthINRDecoder(nn.Module):
         return torch.stack([xx, yy], dim=-1).reshape(h * w, 2)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # z shape: (B, T, z_dim)
         b, t, _ = z.shape
         h, w = self.out_size
-        num_pixels = h * w
 
-        coords = self._coords(z.device, z.dtype)
-        coord_features = self.coord_in(coords).unsqueeze(0)
-        latent_features = self.latent_in(z.reshape(b * t, -1)).unsqueeze(1)
-        x = coord_features + latent_features
+        # 1. Extract FiLM modulation parameters (gamma & beta) for each layer
+        z_flat = z.reshape(b * t, -1)
+        film_params = self.film_gen(z_flat)  # (B * T, num_layers * 2 * hidden_dim)
+        
+        gammas = []
+        betas = []
+        for i in range(self.num_layers):
+            start = i * 2 * self.hidden_dim
+            beta = film_params[:, start : start + self.hidden_dim].unsqueeze(1)    # (B * T, 1, hidden_dim)
+            gamma = film_params[:, start + self.hidden_dim : start + 2 * self.hidden_dim].unsqueeze(1)  # (B * T, 1, hidden_dim)
+            gammas.append(gamma)
+            betas.append(beta)
 
-        for layer in self.finer_layers:
-            x = layer(x)
+        # 2. Generate 2D coordinate grid and align with batch size
+        coords = self._coords(z.device, z.dtype)  # (H*W, 2)
+        x = coords.unsqueeze(0).expand(b * t, -1, -1)  # (B*T, H*W, 2)
 
-        out = self.final_layer(x).reshape(b, t, h, w, self.out_channels)
-        out = out.permute(0, 4, 1, 2, 3).contiguous()
+        # 3. Pass through modulated FINER layers
+        for i, layer in enumerate(self.finer_layers):
+            x = layer(x, gammas[i], betas[i])
+
+        # 4. Final reconstruction mapping
+        out = self.final_layer(x)  # (B * T, H*W, out_channels)
+        out = out.reshape(b, t, h, w, self.out_channels)
+        out = out.permute(0, 4, 1, 2, 3).contiguous()  # (B, out_channels, T, H, W)
         return torch.sigmoid(out + self.output_bias)
 
 
