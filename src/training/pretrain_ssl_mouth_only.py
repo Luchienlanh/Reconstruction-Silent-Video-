@@ -278,6 +278,7 @@ def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
 
     # Save initial samples
     if save_images_every > 0 and checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
         try:
             sample_batch = next(iter(dataloader))
             sample_batch = sample_batch.to(device)
@@ -339,6 +340,7 @@ def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
 
         # Save sample images
         if save_images_every > 0 and checkpoint_dir and (epoch % save_images_every == 0 or epoch == epochs):
+            os.makedirs(checkpoint_dir, exist_ok=True)
             with torch.no_grad():
                 try:
                     sample_batch = next(iter(dataloader))
