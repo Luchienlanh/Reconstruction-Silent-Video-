@@ -132,13 +132,12 @@ class FINERLayer(nn.Module):
             self.linear.weight.uniform_(-bound, bound)
             nn.init.zeros_(self.linear.bias)
 
-    def forward(self, x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         out_dtype = x.dtype
         x = self.linear(x)
         if not self.is_first:
             x = self.omega_zero * x
-        modulated = gamma.float() * x.float() + beta.float()
-        phase = self.omega_zero * (torch.abs(modulated) + 1.0) * modulated
+        phase = self.omega_zero * (torch.abs(x.float()) + 1.0) * x.float()
         phase = torch.nan_to_num(phase, nan=0.0, posinf=1000.0, neginf=-1000.0).clamp(-1000.0, 1000.0)
         return torch.sin(phase).to(dtype=out_dtype)
 
@@ -156,7 +155,6 @@ class FINERMouthINRDecoder(nn.Module):
         hidden_dim: int = 192,
         num_layers: int = 4,
         omega_zero: float = 30.0,
-        use_conv_params: bool = True,
     ):
         super().__init__()
         self.out_size = out_size
@@ -164,21 +162,8 @@ class FINERMouthINRDecoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
 
-        total_params = num_layers * 2 * hidden_dim
-        if use_conv_params:
-            self.param_net = nn.Conv1d(z_dim, total_params, kernel_size=3, padding=1)
-            nn.init.kaiming_uniform_(self.param_net.weight)
-            self.param_net.weight.data *= 0.01
-            nn.init.zeros_(self.param_net.bias)
-        else:
-            self.param_net = nn.Sequential(
-                nn.Linear(z_dim, z_dim),
-                nn.SiLU(inplace=True),
-                nn.Linear(z_dim, total_params),
-            )
-            nn.init.zeros_(self.param_net[-1].bias)
-
         self.coord_in = nn.Linear(2, hidden_dim)
+        self.latent_in = nn.Linear(z_dim, hidden_dim)
         self.finer_layers = nn.ModuleList(
             [
                 FINERLayer(hidden_dim, hidden_dim, omega_zero=omega_zero, is_first=(idx == 0))
@@ -197,30 +182,18 @@ class FINERMouthINRDecoder(nn.Module):
         yy, xx = torch.meshgrid(y, x, indexing="ij")
         return torch.stack([xx, yy], dim=-1).reshape(h * w, 2)
 
-    def _conditioning(self, z: torch.Tensor) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        b, t, _ = z.shape
-        if isinstance(self.param_net, nn.Conv1d):
-            params = self.param_net(z.transpose(1, 2)).transpose(1, 2)
-        else:
-            params = self.param_net(z)
-        params = params.reshape(b * t, self.num_layers, 2, self.hidden_dim)
-        betas = [params[:, idx, 0] for idx in range(self.num_layers)]
-        gammas = [params[:, idx, 1] + 1.0 for idx in range(self.num_layers)]
-        return gammas, betas
-
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         b, t, _ = z.shape
         h, w = self.out_size
         num_pixels = h * w
 
         coords = self._coords(z.device, z.dtype)
-        x = self.coord_in(coords).unsqueeze(0).expand(b * t, num_pixels, self.hidden_dim)
-        gammas, betas = self._conditioning(z)
+        coord_features = self.coord_in(coords).unsqueeze(0)
+        latent_features = self.latent_in(z.reshape(b * t, -1)).unsqueeze(1)
+        x = coord_features + latent_features
 
-        for idx, layer in enumerate(self.finer_layers):
-            gamma = gammas[idx].unsqueeze(1)
-            beta = betas[idx].unsqueeze(1)
-            x = layer(x, gamma, beta)
+        for layer in self.finer_layers:
+            x = layer(x)
 
         out = self.final_layer(x).reshape(b, t, h, w, self.out_channels)
         out = out.permute(0, 4, 1, 2, 3).contiguous()
@@ -277,7 +250,7 @@ def build_ssl_decoder(args: argparse.Namespace, out_size: tuple[int, int]) -> nn
             base_channels=args.decoder_base_channels,
         )
     if decoder_type == "finer":
-        print("[ssl-decoder] Using FINER mouth INR decoder")
+        print("[ssl-decoder] Using plain FINER mouth INR decoder")
         return FINERMouthINRDecoder(
             z_dim=512,
             out_channels=1,
@@ -285,7 +258,6 @@ def build_ssl_decoder(args: argparse.Namespace, out_size: tuple[int, int]) -> nn
             hidden_dim=args.finer_hidden_dim,
             num_layers=args.finer_layers,
             omega_zero=args.finer_omega,
-            use_conv_params=not args.no_finer_conv_params,
         )
     raise ValueError(f"Unknown ssl_decoder={args.ssl_decoder}")
 
@@ -874,7 +846,6 @@ if __name__ == "__main__":
     parser.add_argument("--finer-hidden-dim", type=int, default=192)
     parser.add_argument("--finer-layers", type=int, default=4)
     parser.add_argument("--finer-omega", type=float, default=30.0)
-    parser.add_argument("--no-finer-conv-params", action="store_true", help="Use per-frame MLP conditioning instead of temporal Conv1d conditioning for FINER.")
     parser.add_argument("--plot-train-every", type=int, default=1, help="When no val split exists, save a train reconstruction plot every N epochs.")
     parser.add_argument("--disable-fallback", default=True, action=argparse.BooleanOptionalAction, help="Disable dataset fallback replacement during aligned SSL pretrain.")
 
