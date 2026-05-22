@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import ConcatDataset, DataLoader, Subset, random_split
 from tqdm.auto import tqdm
 
 # Ensure parent and src directories are in sys.path
@@ -684,7 +684,7 @@ def main(args: argparse.Namespace) -> None:
     dataset = VNLipDatasetV2(
         data_dir=str(data_path),
         max_frames=args.max_frames,
-        random_crop=True,
+        random_crop=args.random_crop,
         use_landmarks=False,  # VERY IMPORTANT: Disabling landmarks saves 90% of preprocessing
         return_path=False,
         enable_fallback=not args.disable_fallback,
@@ -706,6 +706,10 @@ def main(args: argparse.Namespace) -> None:
         train_set, val_set = random_split(split_dataset, [train_count, val_count], generator=generator)
     else:
         train_set, val_set = split_dataset, None
+
+    if args.repeat_factor > 1:
+        train_set = ConcatDataset([train_set] * args.repeat_factor)
+        print(f"[data] Repeating train split {args.repeat_factor}x -> optimizer_steps_per_epoch={len(train_set)}")
 
     print(f"[data] Splits: train={len(train_set)}, val={len(val_set) if val_set else 0}")
 
@@ -734,6 +738,11 @@ def main(args: argparse.Namespace) -> None:
     decoder = build_ssl_decoder(args, out_size=(roi_h, roi_w)).to(device)
     model = SSLAutoencoder(visual_encoder, decoder).to(device)
 
+    if args.freeze_encoder:
+        for param in model.visual_encoder.parameters():
+            param.requires_grad = False
+        print("[freeze] visual_encoder frozen; training SSL decoder only.")
+
     is_snn = args.encoder_type.lower() == "snn"
     if is_snn:
         print("[SNN] Parametric LIF / LIF Nodes enabled with Surrogate Gradients (ATan).")
@@ -747,13 +756,12 @@ def main(args: argparse.Namespace) -> None:
     encoder_lr = args.lr if args.lr is not None else args.encoder_lr
     decoder_lr = args.lr if args.lr is not None else args.decoder_lr
     optim_model = model.module if hasattr(model, "module") else model
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": optim_model.visual_encoder.parameters(), "lr": encoder_lr},
-            {"params": optim_model.decoder.parameters(), "lr": decoder_lr},
-        ],
-        weight_decay=args.weight_decay,
-    )
+    optimizer_groups = []
+    encoder_params = [p for p in optim_model.visual_encoder.parameters() if p.requires_grad]
+    if encoder_params:
+        optimizer_groups.append({"params": encoder_params, "lr": encoder_lr})
+    optimizer_groups.append({"params": optim_model.decoder.parameters(), "lr": decoder_lr})
+    optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and args.amp)
 
@@ -888,6 +896,9 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay.")
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping norm. Use 0 to disable.")
     parser.add_argument("--max-frames", type=int, default=60, help="Maximum video frames per sample.")
+    parser.add_argument("--random-crop", default=True, action=argparse.BooleanOptionalAction, help="Randomly crop temporal windows when video_len > max_frames.")
+    parser.add_argument("--repeat-factor", type=int, default=1, help="Repeat train split to get more optimizer steps per epoch, useful for overfit tests.")
+    parser.add_argument("--freeze-encoder", action="store_true", help="Freeze visual encoder and train only the SSL decoder.")
     parser.add_argument("--val-ratio", type=float, default=0.1, help="Validation split ratio.")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of samples for dry-run.")
     parser.add_argument("--num-workers", type=int, default=0, help="Dataloader workers.")

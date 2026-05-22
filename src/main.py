@@ -686,7 +686,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-output-dir", default="Dataset_Output")
     parser.add_argument("--output-dir", default="checkpoints_modular")
     parser.add_argument("--resume", default=None)
-    parser.add_argument("--encoder-type", default="non_snn", choices=["non_snn", "nonsnn", "cnn_transformer", "snn"])
+    parser.add_argument("--encoder-type", default="non_snn", choices=["non_snn", "nonsnn", "cnn_transformer", "snn", "resnet18_temporal"])
     parser.add_argument(
         "--decoder-type",
         default="siren",
