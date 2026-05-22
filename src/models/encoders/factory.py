@@ -57,11 +57,12 @@ class LandmarkEncoder(nn.Module):
         return self.net(x)
 
 class VisualLandmarkEncoder(nn.Module):
-    """Fuse the visual encoder with landmark dynamics before the mel decoder."""
+    """Fuse the visual encoder with landmark dynamics before the mel decoder using simple concatenation."""
     def __init__(self, visual_encoder, num_landmark_points, z_dim=512):
         super().__init__()
         self.visual_encoder = visual_encoder
         self.landmark_encoder = LandmarkEncoder(num_landmark_points, out_dim=z_dim)
+        self.landmark_encoder_v2 = LandmarkEncoderV2(num_landmark_points, out_dim=z_dim)
         self.fusion = nn.Sequential(
             nn.Linear(z_dim * 2, z_dim),
             nn.LayerNorm(z_dim),
@@ -73,7 +74,10 @@ class VisualLandmarkEncoder(nn.Module):
         if landmarks is None:
             raise ValueError("VisualLandmarkEncoder requires landmarks. Set USE_LANDMARKS=False for visual-only training.")
         z_video = self.visual_encoder(video)
-        z_landmark = self.landmark_encoder(landmarks)
+        if landmarks.shape[-1] == 6:
+            z_landmark = self.landmark_encoder_v2(landmarks)
+        else:
+            z_landmark = self.landmark_encoder(landmarks)
         if z_landmark.shape[1] != z_video.shape[1]:
             z_landmark = F.interpolate(
                 z_landmark.transpose(1, 2),

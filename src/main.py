@@ -34,7 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # Import modular components
 from data.dataset import VNLipDatasetV2, collate_pad_v2
-from models.encoders.factory import build_encoder, VisualLandmarkEncoderV2
+from models.encoders.factory import build_encoder, VisualLandmarkEncoder, VisualLandmarkEncoderV2
 from models.decoders.siren import TFiLMSIRENDecoder
 from models.decoders.wire import TFiLMWIREDecoder
 from models.decoders.finer import TFiLMFINERDecoder
@@ -115,35 +115,43 @@ def set_dataset_max_frames(dataset, max_frames: Optional[int]) -> None:
         dataset.max_frames = max_frames
 
 
-def build_base_decoder(decoder_type: str):
+def build_base_decoder(decoder_type: str, target_type: str = "mel_hifigan"):
     decoder_type = decoder_type.lower()
     common = dict(hidden_dim=256, out_dim=80, num_layers=4, use_conv=True)
+    output_act = None if target_type == "mel_hifigan" else "tanh"
     if decoder_type == "siren":
         return TFiLMSIRENDecoder(**common, output_activation=None)
     if decoder_type == "wire":
-        return TFiLMWIREDecoder(**common)
+        return TFiLMWIREDecoder(**common, output_activation=output_act)
     if decoder_type == "finer":
-        return TFiLMFINERDecoder(**common)
+        return TFiLMFINERDecoder(**common, output_activation=output_act)
     if decoder_type == "dual":
-        return DualDecoder(**common)
+        return DualDecoder(**common, output_activation=output_act)
     if decoder_type in {"dual_wrap", "dualwrap"}:
-        return DualWrapDecoder(**common)
+        return DualWrapDecoder(**common, output_activation=output_act)
     if decoder_type in {"wrap_siren", "wrap_fisin", "wrap"}:
-        return TFiLMWrapFISINDecoder(**common)
+        return TFiLMWrapFISINDecoder(**common, output_activation=output_act)
     if decoder_type in {"wrap_wire", "wrap_fiwi"}:
-        return TFiLMWrapFIWIDecoder(**common)
+        return TFiLMWrapFIWIDecoder(**common, output_activation=output_act)
     raise ValueError(f"Unknown decoder_type: {decoder_type}")
 
 
-def build_models(device: torch.device, encoder_type: str, decoder_type: str, num_landmark_points: int):
+def build_models(device: torch.device, encoder_type: str, decoder_type: str, num_landmark_points: int, fusion_type: str = "cross_attn", target_type: str = "mel_hifigan"):
     visual_encoder = build_encoder(encoder_type).to(device)
-    encoder = VisualLandmarkEncoderV2(
-        visual_encoder,
-        num_landmark_points=num_landmark_points,
-        z_dim=512,
-    ).to(device)
+    if fusion_type == "concat":
+        encoder = VisualLandmarkEncoder(
+            visual_encoder,
+            num_landmark_points=num_landmark_points,
+            z_dim=512,
+        ).to(device)
+    else:
+        encoder = VisualLandmarkEncoderV2(
+            visual_encoder,
+            num_landmark_points=num_landmark_points,
+            z_dim=512,
+        ).to(device)
 
-    base_decoder = build_base_decoder(decoder_type).to(device)
+    base_decoder = build_base_decoder(decoder_type, target_type=target_type).to(device)
     decoder = MelTemporalUpsampleDecoder(
         base_decoder,
         sample_rate=16000,
@@ -162,7 +170,7 @@ def make_criterion(args: argparse.Namespace, device: torch.device):
     ).to(device)
 
 
-def unpack_batch(batch, device: torch.device):
+def unpack_batch(batch, device: torch.device, crop_mouth: bool = False, mouth_roi: list[int] = [45, 80, 32, 80]):
     if len(batch) == 5:
         video, landmarks, target, lengths, paths = batch
     elif len(batch) == 4 and torch.is_tensor(batch[1]) and batch[1].dim() == 4:
@@ -170,6 +178,10 @@ def unpack_batch(batch, device: torch.device):
         paths = None
     else:
         raise ValueError("Dataset batch shape is not recognized. Ensure VNLipDatasetV2 returns correct outputs.")
+
+    if crop_mouth:
+        y1, y2, x1, x2 = mouth_roi
+        video = video[:, :, :, y1:y2, x1:x2]
 
     return (
         video.to(device, non_blocking=True),
@@ -294,7 +306,9 @@ def train_one_epoch(
     optimizer.zero_grad(set_to_none=True)
 
     for batch_idx, batch in enumerate(tqdm(loader, desc="train", leave=False)):
-        video, landmarks, target, lengths, _ = unpack_batch(batch, device)
+        crop_mouth = getattr(args, "crop_mouth", False)
+        mouth_roi = getattr(args, "mouth_roi", [45, 80, 32, 80])
+        video, landmarks, target, lengths, _ = unpack_batch(batch, device, crop_mouth=crop_mouth, mouth_roi=mouth_roi)
         reset_snn_if_needed(encoder, args.encoder_type)
 
         with torch.amp.autocast("cuda", enabled=amp_enabled):
@@ -353,7 +367,9 @@ def evaluate(
     plotted = False
 
     for batch in tqdm(loader, desc="val", leave=False):
-        video, landmarks, target, lengths, paths = unpack_batch(batch, device)
+        crop_mouth = getattr(args, "crop_mouth", False)
+        mouth_roi = getattr(args, "mouth_roi", [45, 80, 32, 80])
+        video, landmarks, target, lengths, paths = unpack_batch(batch, device, crop_mouth=crop_mouth, mouth_roi=mouth_roi)
         reset_snn_if_needed(encoder, args.encoder_type)
         z = encoder(video, landmarks)
         pred = decoder(z, target_len=target.shape[1])
@@ -445,7 +461,14 @@ def run(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     dataset, train_loader, val_loader, train_count, val_count = create_loaders(args)
-    encoder, decoder = build_models(device, args.encoder_type, args.decoder_type, dataset.landmark_num_points)
+    encoder, decoder = build_models(
+        device,
+        args.encoder_type,
+        args.decoder_type,
+        dataset.landmark_num_points,
+        fusion_type=getattr(args, "fusion_type", "cross_attn"),
+        target_type="mel_hifigan",
+    )
     
     # Load Pre-trained SSL Weights if specified
     if getattr(args, "pretrained_ssl", None) is not None:
@@ -724,6 +747,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--accum-steps", type=int, default=1, help="Number of steps for gradient accumulation.")
     parser.add_argument("--force-full-frame", action="store_true")
     parser.add_argument("--disable-fallback", action="store_true")
+    parser.add_argument("--crop-mouth", action="store_true", help="Crop mouth region of interest from the input video.")
+    parser.add_argument("--mouth-roi", type=int, nargs=4, default=[45, 80, 32, 80], help="Mouth ROI y1, y2, x1, x2")
+    parser.add_argument("--fusion-type", default="cross_attn", choices=["concat", "cross_attn"], help="Landmark fusion type.")
     parser.add_argument("--lr-scheduler", default="constant", choices=["constant", "onecycle", "cosine"], help="Learning rate scheduler type.")
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Number of warmup epochs for cosine scheduler.")
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning (progressive max_frames).")

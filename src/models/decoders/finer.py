@@ -37,10 +37,11 @@ class FiLMFINER(nn.Module):
         return torch.sin(phase).to(dtype=out_dtype)
 
 class TFiLMFINERDecoder(nn.Module):
-    def __init__(self, condition_dim=512, hidden_dim=256, out_dim=640, num_layers=4, omega_zero=30.0, use_conv=False):
+    def __init__(self, condition_dim=512, hidden_dim=256, out_dim=640, num_layers=4, omega_zero=30.0, use_conv=False, output_activation="tanh"):
         super().__init__()
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
+        self.output_activation = output_activation
 
         total_params = num_layers * 2 * hidden_dim
         if use_conv:
@@ -126,7 +127,10 @@ class TFiLMFINERDecoder(nn.Module):
         for i, layer in enumerate(self.finer_layers):
             X = layer(X, gammas_flat[i], betas_flat[i])
         out = self.final_layer(X)
-        out = torch.tanh(out) * self.output_scale  # [-scale, +scale], waveform range
+        if self.output_activation == "tanh":
+            out = torch.tanh(out) * self.output_scale  # [-scale, +scale], waveform range
+        elif self.output_activation not in (None, "none", "linear"):
+            raise ValueError(f"Unsupported output_activation={self.output_activation}")
         out = out.reshape(B, T, -1)
         return out
 
