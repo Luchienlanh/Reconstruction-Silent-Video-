@@ -196,7 +196,7 @@ class FINERMouthINRDecoder(nn.Module):
             )
 
         self.final_layer = nn.Linear(hidden_dim, out_channels)
-        nn.init.normal_(self.final_layer.weight, mean=0.0, std=1e-4)
+        nn.init.xavier_uniform_(self.final_layer.weight)
         nn.init.zeros_(self.final_layer.bias)
         self.output_bias = nn.Parameter(torch.zeros(1))
 
