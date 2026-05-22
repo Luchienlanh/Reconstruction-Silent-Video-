@@ -49,6 +49,12 @@ def safe_text(value) -> str:
     return str(value).encode("ascii", errors="backslashreplace").decode("ascii")
 
 
+def reset_snn_net(model: nn.Module) -> None:
+    if SNN_AVAILABLE:
+        unwrapped = model.module if hasattr(model, "module") else model
+        functional.reset_net(unwrapped.backbone)
+
+
 class VideoDecoder3D(nn.Module):
     """
     Hybrid 2D/3D Video Decoder.
@@ -221,7 +227,7 @@ def train_one_epoch(
 
         # Reset SNN states if using SNN
         if is_snn:
-            functional.reset_net(model.backbone)
+            reset_snn_net(model)
 
         try:
             with torch.amp.autocast("cuda", enabled=amp):
@@ -259,7 +265,7 @@ def train_one_epoch(
 
         finally:
             if is_snn:
-                functional.reset_net(model.backbone)
+                reset_snn_net(model)
 
     return total_loss / max(1, processed_batches)
 
@@ -286,7 +292,7 @@ def evaluate(
         video = video.to(device, non_blocking=True)
 
         if is_snn:
-            functional.reset_net(model.backbone)
+            reset_snn_net(model)
 
         recon_video = model(video)
         
@@ -305,7 +311,7 @@ def evaluate(
             plotted = True
 
         if is_snn:
-            functional.reset_net(model.backbone)
+            reset_snn_net(model)
 
     return total_loss / max(1, processed_batches)
 
