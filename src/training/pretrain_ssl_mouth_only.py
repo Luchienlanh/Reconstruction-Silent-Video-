@@ -1,30 +1,24 @@
 """
-pretrain_ssl_mouth_only.py
-==========================
-Self-Supervised Pre-training (SSL) script for lip-reading visual feature extractors.
-Uses aligned full-frame video as input and reconstructs only the fixed mouth patch.
-The pretraining decoder is discarded after SSL; the visual encoder weights are loaded
-into the main mel-reconstruction system.
+pretrain_byol_mouth.py
+======================
+Bootstrap Your Own Latent (BYOL) pretraining for mouth video encoder (ResNet2+1D).
+No labels, no negative pairs, only relies on augmentations of the same clip.
 """
 
 import os
 import sys
-import gc
-import time
-import argparse
 import random
-import math
+import argparse
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import ConcatDataset, DataLoader, Subset, random_split
-from tqdm.auto import tqdm
+from torch.utils.data import Dataset, DataLoader, random_split
+from tqdm import tqdm
 
-# Ensure parent and src directories are in sys.path
+# Adjust path to import your encoder builder
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent.parent
 if str(CURRENT_DIR) not in sys.path:
@@ -32,927 +26,353 @@ if str(CURRENT_DIR) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Import dataset components
-from src.data.dataset import VNLipDatasetV2, collate_pad_v2
-
-# Try to import SpikingJelly components
+# Import your dataset and encoder builder
+# If you don't have these modules, replace with direct dataset loading
 try:
-    from spikingjelly.activation_based import functional
-    SNN_AVAILABLE = True
-except ImportError:
-    SNN_AVAILABLE = False
-
-
-def safe_text(value) -> str:
-    return str(value).encode("ascii", errors="backslashreplace").decode("ascii")
-
-
-def reset_snn_net(model: nn.Module) -> None:
-    if SNN_AVAILABLE:
-        unwrapped = model.module if hasattr(model, "module") else model
-        functional.reset_net(unwrapped.backbone)
-
-
-class MouthPatchDecoder(nn.Module):
-    """
-    Lightweight SSL-only decoder.
-    Takes a sequence representation of shape (B, T, 512) and reconstructs a mouth
-    patch of shape (B, 1, T, H, W). This decoder is not used by the main mel model.
-    """
-    def __init__(
-        self,
-        z_dim: int = 512,
-        out_channels: int = 1,
-        out_size: tuple[int, int] = (35, 48),
-        base_channels: int = 192,
-    ):
-        super().__init__()
-        self.out_size = out_size
-        self.seed_h = 5
-        self.seed_w = 6
-        self.base_channels = base_channels
-
-        self.seed = nn.Sequential(
-            nn.Linear(z_dim, base_channels * self.seed_h * self.seed_w),
-            nn.LayerNorm(base_channels * self.seed_h * self.seed_w),
-            nn.SiLU(inplace=True),
-        )
-
-        self.spatial_upsample = nn.Sequential(
-            # (B * T, C, 5, 6) -> (B * T, 128, 10, 12)
-            nn.ConvTranspose2d(base_channels, 128, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.GroupNorm(16, 128),
-            nn.SiLU(inplace=True),
-
-            # (B * T, 128, 10, 12) -> (B * T, 64, 20, 24)
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.GroupNorm(8, 64),
-            nn.SiLU(inplace=True),
-
-            # (B * T, 64, 20, 24) -> (B * T, 32, 40, 48)
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(inplace=True),
-        )
-
-        self.temporal_refine = nn.Sequential(
-            nn.Conv3d(32, 32, kernel_size=(5, 3, 3), padding=(2, 1, 1), bias=False),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(inplace=True),
-            nn.Conv3d(32, out_channels, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # z shape: (B, T, 512)
-        B, T, C = z.shape
-        x = self.seed(z.reshape(B * T, C))
-        x = x.reshape(B * T, self.base_channels, self.seed_h, self.seed_w)
-        x = self.spatial_upsample(x)
-
-        if x.shape[-2:] != self.out_size:
-            x = F.interpolate(x, size=self.out_size, mode="bilinear", align_corners=False)
-
-        H, W = self.out_size
-        x = x.reshape(B, T, 32, H, W).permute(0, 2, 1, 3, 4).contiguous()
-        return self.temporal_refine(x)
-
-
-class FINERLayer(nn.Module):
-    def __init__(self, in_features: int, out_features: int, omega_zero: float = 30.0, is_first: bool = False):
-        super().__init__()
-        self.linear = nn.Linear(in_features, out_features)
-        self.omega_zero = omega_zero
-        self.is_first = is_first
-        self.init_weights()
-
-    def init_weights(self):
-        with torch.no_grad():
-            if self.is_first:
-                # First layer maps low-dim coordinates, weight bound should be 1 / in_features
-                bound = 1.0 / self.linear.in_features
-            else:
-                # Subsequent layers map high-dim features
-                bound = float(torch.sqrt(torch.tensor(6.0 / self.linear.in_features)) / self.omega_zero)
-            self.linear.weight.uniform_(-bound, bound)
-            nn.init.zeros_(self.linear.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out_dtype = x.dtype
-        x = self.linear(x)
-        x = self.omega_zero * x.float()
-        phase = (torch.abs(x) + 1.0) * x
-        phase = torch.nan_to_num(phase, nan=0.0, posinf=1000.0, neginf=-1000.0).clamp(-1000.0, 1000.0)
-        return torch.sin(phase).to(dtype=out_dtype)
-
-
-class FINERMouthINRDecoder(nn.Module):
-    """
-    SSL-only plain FINER coordinate decoder for mouth patches.
-    It learns a continuous coordinate function: f(z_t, x, y) -> pixel intensity.
-    """
-    def __init__(
-        self,
-        z_dim: int = 512,
-        out_channels: int = 1,
-        out_size: tuple[int, int] = (35, 48),
-        hidden_dim: int = 192,
-        num_layers: int = 4,
-        omega_zero: float = 30.0,
-    ):
-        super().__init__()
-        self.out_size = out_size
-        self.out_channels = out_channels
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        self.omega_zero = omega_zero
-
-        self.coord_proj = nn.Linear(2, hidden_dim)
-        self.latent_proj = nn.Sequential(
-            nn.LayerNorm(z_dim),
-            nn.Linear(z_dim, hidden_dim),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.fuse = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.SiLU(inplace=True),
-        )
-
-        nn.init.xavier_uniform_(self.coord_proj.weight)
-        nn.init.zeros_(self.coord_proj.bias)
-        for module in list(self.latent_proj.modules()) + list(self.fuse.modules()):
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.zeros_(module.bias)
-
-        self.finer_layers = nn.ModuleList()
-        self.finer_layers.append(
-            FINERLayer(in_features=hidden_dim, out_features=hidden_dim, omega_zero=omega_zero, is_first=False)
-        )
-        for _ in range(1, num_layers):
-            self.finer_layers.append(
-                FINERLayer(in_features=hidden_dim, out_features=hidden_dim, omega_zero=omega_zero, is_first=False)
-            )
-
-        self.final_layer = nn.Linear(hidden_dim, out_channels)
-        nn.init.xavier_uniform_(self.final_layer.weight, gain=0.5)
-        nn.init.zeros_(self.final_layer.bias)
-        self.output_bias = nn.Parameter(torch.zeros(1))
-
-    def _coords(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        h, w = self.out_size
-        y = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype)
-        x = torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype)
-        yy, xx = torch.meshgrid(y, x, indexing="ij")
-        return torch.stack([xx, yy], dim=-1).reshape(h * w, 2)
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # z shape: (B, T, z_dim)
-        b, t, _ = z.shape
-        h, w = self.out_size
-
-        z_flat = z.reshape(b * t, -1)
-        coords = self._coords(z.device, z.dtype)  # (H*W, 2)
-        coord_features = self.coord_proj(coords).unsqueeze(0).expand(b * t, -1, -1)
-        latent_features = self.latent_proj(z_flat).unsqueeze(1).expand(-1, h * w, -1)
-        x = self.fuse(torch.cat([coord_features, latent_features], dim=-1))
-
-        for layer in self.finer_layers:
-            x = layer(x)
-
-        out = self.final_layer(x)  # (B * T, H*W, out_channels)
-        out = out.reshape(b, t, h, w, self.out_channels)
-        out = out.permute(0, 4, 1, 2, 3).contiguous()  # (B, out_channels, T, H, W)
-        return torch.sigmoid(out + self.output_bias)
-
-
-class SSLAutoencoder(nn.Module):
-    """
-    Wrapper module to combine the visual encoder and SSL-only mouth decoder.
-    """
-    def __init__(self, visual_encoder: nn.Module, decoder: nn.Module):
-        super().__init__()
-        self.visual_encoder = visual_encoder
-        self.backbone = visual_encoder
-        self.decoder = decoder
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.visual_encoder(x)  # (B, T, 512)
-        return self.decoder(z)      # (B, 1, T, H_roi, W_roi)
-
-
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def default_data_dir() -> str:
-    full_frame = PROJECT_ROOT / "FullFrame_test"
-    if full_frame.is_dir():
-        return "Processed_Data_Mel_HiFiGAN_FullFrame"
-    return "Processed_Data_Mel_HiFiGAN"
-
-
-def build_visual_encoder(encoder_type: str) -> nn.Module:
-    encoder_type = encoder_type.lower()
-    if encoder_type == "snn" and not SNN_AVAILABLE:
-        raise ImportError("SpikingJelly is not installed, cannot use SNN visual encoder.")
+    from src.data.dataset import VNLipDatasetV2, collate_pad_v2
     from src.models.encoders.factory import build_encoder
-    print(f"[visual-encoder] Instantiating full visual encoder: {encoder_type}")
-    return build_encoder(encoder_type)
+    USE_FACTORY = True
+except ImportError:
+    USE_FACTORY = False
+    print("Warning: Could not import from src modules. Using fallback dataset and encoder.")
+
+# ========== Fallback dataset if src not available ==========
+class SimpleMouthDataset(Dataset):
+    """Fallback dataset: load .pt files, crop mouth ROI, return video tensor."""
+    def __init__(self, data_dir, mouth_roi=(45,80,32,80), max_frames=30):
+        self.data_dir = Path(data_dir)
+        self.mouth_roi = mouth_roi
+        self.max_frames = max_frames
+        self.files = list(self.data_dir.glob("*.pt"))
+        print(f"Loaded {len(self.files)} .pt files from {data_dir}")
+        if not self.files:
+            raise RuntimeError(f"No .pt files in {data_dir}")
+
+    def _load_video(self, path):
+        data = torch.load(path, map_location='cpu', weights_only=False)
+        video = data['video'].float()
+        # video shape: (C, T, H, W) where C=1, H=W=112
+        if video.dim() == 3:
+            video = video.unsqueeze(0)
+        # Crop mouth ROI
+        y1, y2, x1, x2 = self.mouth_roi
+        mouth = video[:, :, :, y1:y2, x1:x2]  # (1, T, H_roi, W_roi)
+        T = mouth.shape[1]
+        if T > self.max_frames:
+            start = random.randint(0, T - self.max_frames)
+            mouth = mouth[:, start:start+self.max_frames]
+        elif T < self.max_frames:
+            pad = self.max_frames - T
+            mouth = F.pad(mouth, (0,0,0,0,0,pad,0,0))
+        return mouth
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        path = self.files[idx]
+        return self._load_video(path)  # (1, max_frames, H_roi, W_roi)
+
+def collate_byol(batch):
+    # batch: list of (mouth_video) each shape (1, T, H, W)
+    # Stack to (B, 1, T, H, W)
+    return torch.stack(batch, dim=0)
 
 
-def build_ssl_decoder(args: argparse.Namespace, out_size: tuple[int, int]) -> nn.Module:
-    decoder_type = args.ssl_decoder.lower()
-    if decoder_type == "conv":
-        print("[ssl-decoder] Using ConvTranspose mouth patch decoder")
-        return MouthPatchDecoder(
-            z_dim=512,
-            out_channels=1,
-            out_size=out_size,
-            base_channels=args.decoder_base_channels,
-        )
-    if decoder_type == "finer":
-        print("[ssl-decoder] Using plain FINER mouth INR decoder")
-        return FINERMouthINRDecoder(
-            z_dim=512,
-            out_channels=1,
-            out_size=out_size,
-            hidden_dim=args.finer_hidden_dim,
-            num_layers=args.finer_layers,
-            omega_zero=args.finer_omega,
-        )
-    raise ValueError(f"Unknown ssl_decoder={args.ssl_decoder}")
+# ========== Augmentations for mouth videos ==========
+class RandomBrightness(nn.Module):
+    def __init__(self, strength=0.1):
+        super().__init__()
+        self.strength = strength
+    def forward(self, x):
+        if random.random() < 0.5:
+            return x + torch.randn(1, device=x.device) * self.strength
+        return x
 
+class RandomContrast(nn.Module):
+    def __init__(self, min_factor=0.7, max_factor=1.3):
+        super().__init__()
+        self.min_factor = min_factor
+        self.max_factor = max_factor
+    def forward(self, x):
+        if random.random() < 0.5:
+            factor = random.uniform(self.min_factor, self.max_factor)
+            return x * factor
+        return x
 
-def parse_mouth_roi(values: list[int]) -> tuple[int, int, int, int]:
-    if len(values) != 4:
-        raise ValueError("--mouth-roi expects four integers: y1 y2 x1 x2")
-    y1, y2, x1, x2 = [int(v) for v in values]
-    if not (0 <= y1 < y2 <= 112 and 0 <= x1 < x2 <= 112):
-        raise ValueError(f"Invalid mouth ROI {(y1, y2, x1, x2)} for 112x112 frames.")
-    return y1, y2, x1, x2
+class RandomTimeMask(nn.Module):
+    def __init__(self, max_mask_frames=4):
+        super().__init__()
+        self.max_mask = max_mask_frames
+    def forward(self, x):
+        # x: (B, C, T, H, W)
+        B, C, T, H, W = x.shape
+        if random.random() < 0.5:
+            mask_len = random.randint(1, min(self.max_mask, T//2))
+            start = random.randint(0, T - mask_len)
+            x = x.clone()
+            x[:, :, start:start+mask_len] = 0.0
+        return x
 
-
-def crop_mouth(video: torch.Tensor, mouth_roi: tuple[int, int, int, int]) -> torch.Tensor:
-    y1, y2, x1, x2 = mouth_roi
-    return video[:, :, :, y1:y2, x1:x2]
-
-
-def make_ssl_input(
-    video: torch.Tensor,
-    mouth_roi: tuple[int, int, int, int],
-    input_mode: str,
-    mask_fill: float,
-) -> torch.Tensor:
-    if input_mode == "full":
-        return video
-    mouth = crop_mouth(video, mouth_roi)
-    if input_mode == "mouth_mask":
-        masked = torch.full_like(video, float(mask_fill))
-        y1, y2, x1, x2 = mouth_roi
-        masked[:, :, :, y1:y2, x1:x2] = mouth
-        return masked
-    if input_mode == "mouth_crop":
-        return F.interpolate(mouth, size=(video.shape[2], 112, 112), mode="trilinear", align_corners=False)
-    raise ValueError(f"Unknown input_mode={input_mode}")
-
-
-def sobel_edges(x: torch.Tensor) -> torch.Tensor:
-    b, c, t, h, w = x.shape
-    flat = x.reshape(b * c * t, 1, h, w)
-    kernel_x = torch.tensor(
-        [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
-        device=x.device,
-        dtype=x.dtype,
-    ).unsqueeze(0)
-    kernel_y = torch.tensor(
-        [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
-        device=x.device,
-        dtype=x.dtype,
-    ).unsqueeze(0)
-    grad_x = F.conv2d(flat, kernel_x, padding=1)
-    grad_y = F.conv2d(flat, kernel_y, padding=1)
-    edge = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-6)
-    return edge.reshape(b, c, t, h, w)
-
-
-def spatial_tv(x: torch.Tensor) -> torch.Tensor:
-    tv = x.new_tensor(0.0)
-    if x.shape[-1] > 1:
-        tv = tv + (x[..., :, 1:] - x[..., :, :-1]).abs().mean()
-    if x.shape[-2] > 1:
-        tv = tv + (x[..., 1:, :] - x[..., :-1, :]).abs().mean()
-    return tv
-
-
-def compute_reconstruction_metrics(
-    mouth_recon: torch.Tensor,
-    mouth_gt: torch.Tensor,
-    mse_weight: float,
-    temporal_weight: float,
-    edge_weight: float,
-    motion_weight: float,
-    tv_weight: float,
-) -> dict[str, torch.Tensor]:
-    loss_l1 = F.l1_loss(mouth_recon, mouth_gt)
-    loss_mse = F.mse_loss(mouth_recon, mouth_gt)
-    mean_baseline_l1 = F.l1_loss(torch.full_like(mouth_gt, mouth_gt.mean().detach()), mouth_gt)
-    gt_std = mouth_gt.std(unbiased=False)
-    recon_std = mouth_recon.std(unbiased=False)
-
-    if mouth_gt.shape[2] > 1:
-        diff_gt = mouth_gt[:, :, 1:] - mouth_gt[:, :, :-1]
-        diff_recon = mouth_recon[:, :, 1:] - mouth_recon[:, :, :-1]
-        loss_temporal = F.l1_loss(diff_recon, diff_gt)
-        gt_motion = diff_gt.abs().mean()
-        recon_motion = diff_recon.abs().mean()
-        motion_ratio = recon_motion / gt_motion.clamp_min(1e-6)
-        loss_motion_mag = F.l1_loss(recon_motion, gt_motion.detach())
-    else:
-        loss_temporal = mouth_gt.new_tensor(0.0)
-        gt_motion = mouth_gt.new_tensor(0.0)
-        recon_motion = mouth_gt.new_tensor(0.0)
-        motion_ratio = mouth_gt.new_tensor(0.0)
-        loss_motion_mag = mouth_gt.new_tensor(0.0)
-
-    loss_edge = F.l1_loss(sobel_edges(mouth_recon), sobel_edges(mouth_gt))
-    recon_tv = spatial_tv(mouth_recon)
-    gt_tv = spatial_tv(mouth_gt)
-    loss_tv = F.l1_loss(recon_tv, gt_tv.detach())
-    loss = (
-        loss_l1
-        + mse_weight * loss_mse
-        + temporal_weight * loss_temporal
-        + edge_weight * loss_edge
-        + motion_weight * loss_motion_mag
-        + tv_weight * loss_tv
+def get_byol_augmentation():
+    """Augmentation pipeline for BYOL: not too aggressive to preserve lip motion."""
+    return nn.Sequential(
+        RandomBrightness(strength=0.05),
+        RandomContrast(0.8, 1.2),
+        RandomTimeMask(max_mask_frames=4),
+        # Optional: small Gaussian blur
     )
 
-    return {
-        "loss": loss,
-        "l1": loss_l1,
-        "mse": loss_mse,
-        "mean_l1": mean_baseline_l1,
-        "gt_std": gt_std,
-        "recon_std": recon_std,
-        "temporal": loss_temporal,
-        "edge": loss_edge,
-        "motion_mag": loss_motion_mag,
-        "tv": loss_tv,
-        "gt_motion": gt_motion,
-        "recon_motion": recon_motion,
-        "motion_ratio": motion_ratio,
-    }
+
+# ========== BYOL Components ==========
+class BYOLProjector(nn.Module):
+    def __init__(self, in_dim=512, hidden_dim=4096, out_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim),
+            nn.BatchNorm1d(out_dim, affine=False)  # no affine for target
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class BYOLPredictor(nn.Module):
+    def __init__(self, in_dim=256, hidden_dim=4096, out_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class BYOL(nn.Module):
+    def __init__(self, encoder, projection_dim=256, hidden_dim=4096, momentum=0.996):
+        super().__init__()
+        self.online_encoder = encoder
+        self.target_encoder = self._copy_encoder(encoder)
+        self.online_projector = BYOLProjector(512, hidden_dim, projection_dim)
+        self.target_projector = BYOLProjector(512, hidden_dim, projection_dim)
+        self.predictor = BYOLPredictor(projection_dim, hidden_dim, projection_dim)
+        self.momentum = momentum
+
+        # Stop gradients for target encoder
+        for p in self.target_encoder.parameters():
+            p.requires_grad = False
+        for p in self.target_projector.parameters():
+            p.requires_grad = False
+
+        self._update_target(keep_online=True)  # init target = online
+
+    def _copy_encoder(self, encoder):
+        """Deep copy encoder without shared parameters."""
+        import copy
+        copy_enc = copy.deepcopy(encoder)
+        return copy_enc
+
+    @torch.no_grad()
+    def _update_target(self, keep_online=False):
+        """Momentum update for target network."""
+        for param_online, param_target in zip(self.online_encoder.parameters(), self.target_encoder.parameters()):
+            param_target.data = param_target.data * self.momentum + param_online.data * (1 - self.momentum)
+        for param_online, param_target in zip(self.online_projector.parameters(), self.target_projector.parameters()):
+            param_target.data = param_target.data * self.momentum + param_online.data * (1 - self.momentum)
+        if keep_online:
+            for param_online in self.online_encoder.parameters():
+                param_online.requires_grad = True
+
+    def forward(self, x1, x2):
+        # x1, x2: (B, 1, T, H, W) two augmented views of the same clip
+        # Encode and temporal pool
+        z1 = self.online_encoder(x1)   # (B, T, 512)
+        z2 = self.online_encoder(x2)
+        z1 = z1.mean(dim=1)             # (B, 512)
+        z2 = z2.mean(dim=1)
+
+        # Project
+        p1 = self.online_projector(z1)
+        p2 = self.online_projector(z2)
+        # Predict
+        q1 = self.predictor(p1)
+        q2 = self.predictor(p2)
+
+        with torch.no_grad():
+            target_z1 = self.target_encoder(x1).mean(dim=1)
+            target_z2 = self.target_encoder(x2).mean(dim=1)
+            target_p1 = self.target_projector(target_z1)
+            target_p2 = self.target_projector(target_z2)
+
+        # Symmetric loss: q1 with target_p2, q2 with target_p1
+        loss = 2 - (F.cosine_similarity(q1, target_p2, dim=-1).mean() +
+                    F.cosine_similarity(q2, target_p1, dim=-1).mean())
+        return loss
+
+    @torch.no_grad()
+    def update_target(self):
+        self._update_target()
 
 
-def save_reconstruction_plot(
-    original: torch.Tensor,
-    mouth_gt: torch.Tensor,
-    mouth_recon: torch.Tensor,
-    output_path: Path,
-    epoch: int,
-    mouth_roi: tuple[int, int, int, int],
-) -> None:
-    """
-    Save full-frame context plus mouth target/reconstruction.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
-
-    orig = original.detach().cpu().squeeze(0).numpy()  # (T, 112, 112)
-    gt = mouth_gt.detach().cpu().squeeze(0).numpy()
-    recon = mouth_recon.detach().cpu().squeeze(0).numpy()
-    T = orig.shape[0]
-    y1, y2, x1, x2 = mouth_roi
-
-    num_frames_to_plot = min(5, T)
-    indices = np.linspace(0, T - 1, num_frames_to_plot, dtype=int)
-
-    fig, axes = plt.subplots(3, num_frames_to_plot, figsize=(3 * num_frames_to_plot, 7), constrained_layout=True)
-    
-    if num_frames_to_plot == 1:
-        axes = np.expand_dims(axes, axis=1)
-
-    for col_idx, frame_idx in enumerate(indices):
-        axes[0, col_idx].imshow(orig[frame_idx], cmap="gray", vmin=0.0, vmax=1.0)
-        axes[0, col_idx].axis("off")
-        rect_orig = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=1.5, edgecolor="red", facecolor="none", linestyle="--")
-        axes[0, col_idx].add_patch(rect_orig)
-        if col_idx == 0:
-            axes[0, col_idx].set_title("Full frame + ROI", loc="left", fontsize=12, fontweight="bold")
-        else:
-            axes[0, col_idx].set_title(f"Frame {frame_idx}")
-
-        axes[1, col_idx].imshow(gt[frame_idx], cmap="gray", vmin=0.0, vmax=1.0)
-        axes[1, col_idx].axis("off")
-        if col_idx == 0:
-            axes[1, col_idx].set_title("Mouth target", loc="left", fontsize=12, fontweight="bold")
-
-        axes[2, col_idx].imshow(recon[frame_idx], cmap="gray", vmin=0.0, vmax=1.0)
-        axes[2, col_idx].axis("off")
-        if col_idx == 0:
-            axes[2, col_idx].set_title("Mouth reconstructed", loc="left", fontsize=12, fontweight="bold")
-
-    fig.suptitle(f"SSL Mouth Patch Reconstruction (Epoch {epoch})", fontsize=14, fontweight="bold")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=120)
-    plt.close()
-
-
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    scaler: torch.amp.GradScaler,
-    accum_steps: int,
-    is_snn: bool,
-    amp: bool,
-    mouth_roi: tuple[int, int, int, int],
-    input_mode: str,
-    mask_fill: float,
-    mse_weight: float,
-    temporal_weight: float,
-    edge_weight: float,
-    motion_weight: float,
-    tv_weight: float,
-    max_grad_norm: float,
-) -> dict[str, float]:
+# ========== Training ==========
+def train_byol(model, dataloader, optimizer, device, epochs=50,
+               max_grad_norm=1.0, checkpoint_dir=None, save_every=5):
     model.train()
-    totals = {
-        "loss": 0.0,
-        "l1": 0.0,
-        "mse": 0.0,
-        "mean_l1": 0.0,
-        "gt_std": 0.0,
-        "recon_std": 0.0,
-        "temporal": 0.0,
-        "edge": 0.0,
-        "motion_mag": 0.0,
-        "tv": 0.0,
-        "gt_motion": 0.0,
-        "recon_motion": 0.0,
-        "motion_ratio": 0.0,
-    }
-    processed_batches = 0
-    optimizer.zero_grad(set_to_none=True)
+    aug = get_byol_augmentation().to(device)
+    best_loss = float('inf')
 
-    pbar = tqdm(loader, desc="  SSL Train")
-    for batch_idx, batch in enumerate(pbar):
-        video, _, _ = batch
-        video = video.to(device, non_blocking=True)  # (B, 1, T, 112, 112)
+    for epoch in range(1, epochs+1):
+        total_loss = 0.0
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
+        for batch_idx, video in enumerate(pbar):
+            video = video.to(device, non_blocking=True)  # (B, 1, T, H_roi, W_roi)
+            # Create two augmented views
+            v1 = aug(video)
+            v2 = aug(video)
 
-        # Reset SNN states if using SNN
-        if is_snn:
-            reset_snn_net(model)
+            loss = model(v1, v2)
 
-        try:
-            with torch.amp.autocast("cuda", enabled=amp):
-                ssl_input = make_ssl_input(video, mouth_roi, input_mode, mask_fill)
-                mouth_recon = model(ssl_input)
-            mouth_gt = crop_mouth(video, mouth_roi)
+            optimizer.zero_grad()
+            loss.backward()
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+            model.update_target()
 
-            with torch.amp.autocast("cuda", enabled=False):
-                metrics = compute_reconstruction_metrics(
-                    mouth_recon.float(),
-                    mouth_gt.float(),
-                    mse_weight=mse_weight,
-                    temporal_weight=temporal_weight,
-                    edge_weight=edge_weight,
-                    motion_weight=motion_weight,
-                    tv_weight=tv_weight,
-                )
-                loss = metrics["loss"] / accum_steps
+            total_loss += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-            # Scale gradients
-            scaler.scale(loss).backward()
+        avg_loss = total_loss / len(dataloader)
+        print(f"Epoch {epoch:3d} | Loss: {avg_loss:.6f}")
 
-            if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(loader):
-                scaler.unscale_(optimizer)
-                if max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
+        if checkpoint_dir and (epoch % save_every == 0 or epoch == epochs):
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            checkpoint = {
+                'epoch': epoch,
+                'online_encoder_state_dict': model.online_encoder.state_dict(),
+                'loss': avg_loss,
+                'optimizer': optimizer.state_dict(),
+            }
+            torch.save(checkpoint, os.path.join(checkpoint_dir, f"byol_epoch_{epoch}.pth"))
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                torch.save(checkpoint, os.path.join(checkpoint_dir, "byol_best.pth"))
+                print(f"  -> Best model saved (loss={best_loss:.6f})")
 
-            for key in totals:
-                totals[key] += float(metrics[key].detach().cpu())
-            processed_batches += 1
-            pbar.set_postfix(
-                loss=f"{float(metrics['loss'].detach().cpu()):.5f}",
-                l1=f"{float(metrics['l1'].detach().cpu()):.5f}",
-                mean=f"{float(metrics['mean_l1'].detach().cpu()):.5f}",
-                std=f"{float(metrics['recon_std'].detach().cpu()):.4f}",
-                motion=f"{float(metrics['motion_ratio'].detach().cpu()):.3f}",
-            )
-
-        except torch.cuda.OutOfMemoryError:
-            print(f"[OOM] Out of memory error in batch index {batch_idx}. Skipping.")
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-            gc.collect()
-            raise
-
-        finally:
-            if is_snn:
-                reset_snn_net(model)
-
-    return {key: value / max(1, processed_batches) for key, value in totals.items()}
+    return model.online_encoder
 
 
-@torch.no_grad()
-def save_train_reconstruction_sample(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    is_snn: bool,
-    epoch: int,
-    plot_dir: Path,
-    mouth_roi: tuple[int, int, int, int],
-    input_mode: str,
-    mask_fill: float,
-) -> None:
-    model.eval()
-    batch = next(iter(loader))
-    video, _, _ = batch
-    video = video.to(device, non_blocking=True)
+# ========== Main ==========
+def main():
+    parser = argparse.ArgumentParser(description="BYOL pretraining for mouth video encoder")
+    parser.add_argument("--data-dir", type=str, default="Processed_Data_Mel_HiFiGAN",
+                        help="Directory containing .pt files (video frames).")
+    parser.add_argument("--output-dir", type=str, default="checkpoints_byol",
+                        help="Directory to save checkpoints.")
+    parser.add_argument("--encoder-type", type=str, default="non_snn",
+                        choices=["non_snn", "snn", "resnet18_temporal"],
+                        help="Backbone encoder type (must be (2+1)D).")
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--max-frames", type=int, default=30,
+                        help="Number of frames per clip.")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--momentum", type=float, default=0.996,
+                        help="Momentum for target network update.")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--mouth-roi", nargs=4, type=int, default=[45,80,32,80],
+                        metavar=("Y1","Y2","X1","X2"), help="Mouth crop coordinates in 112x112 frame.")
+    args = parser.parse_args()
 
-    if is_snn:
-        reset_snn_net(model)
+    # Set seeds
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
-    ssl_input = make_ssl_input(video, mouth_roi, input_mode, mask_fill)
-    mouth_recon = model(ssl_input)
-    mouth_gt = crop_mouth(video, mouth_roi)
-    plot_path = plot_dir / f"train_reconstruction_epoch_{epoch:04d}.png"
-    save_reconstruction_plot(video[0], mouth_gt[0], mouth_recon[0], plot_path, epoch, mouth_roi)
+    device = torch.device(args.device)
+    print(f"Using device: {device}")
 
-    if is_snn:
-        reset_snn_net(model)
-
-
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    is_snn: bool,
-    epoch: int,
-    plot_dir: Path,
-    mouth_roi: tuple[int, int, int, int],
-    input_mode: str,
-    mask_fill: float,
-    mse_weight: float,
-    temporal_weight: float,
-    edge_weight: float,
-    motion_weight: float,
-    tv_weight: float,
-) -> dict[str, float]:
-    model.eval()
-    totals = {
-        "loss": 0.0,
-        "l1": 0.0,
-        "mse": 0.0,
-        "mean_l1": 0.0,
-        "gt_std": 0.0,
-        "recon_std": 0.0,
-        "temporal": 0.0,
-        "edge": 0.0,
-        "motion_mag": 0.0,
-        "tv": 0.0,
-        "gt_motion": 0.0,
-        "recon_motion": 0.0,
-        "motion_ratio": 0.0,
-    }
-    processed_batches = 0
-
-    # Save visual plot for the first sample in the validation set
-    plotted = False
-
-    pbar = tqdm(loader, desc="  SSL Val")
-    for batch_idx, batch in enumerate(pbar):
-        video, _, _ = batch
-        video = video.to(device, non_blocking=True)
-
-        if is_snn:
-            reset_snn_net(model)
-
-        ssl_input = make_ssl_input(video, mouth_roi, input_mode, mask_fill)
-        mouth_recon = model(ssl_input)
-        mouth_gt = crop_mouth(video, mouth_roi)
-        metrics = compute_reconstruction_metrics(
-            mouth_recon.float(),
-            mouth_gt.float(),
-            mse_weight=mse_weight,
-            temporal_weight=temporal_weight,
-            edge_weight=edge_weight,
-            motion_weight=motion_weight,
-            tv_weight=tv_weight,
+    # 1. Dataset
+    if USE_FACTORY:
+        # Use VNLipDatasetV2 but we only need video, no landmarks/target
+        # Note: set use_landmarks=False, random_crop=False to avoid unnecessary data
+        dataset = VNLipDatasetV2(
+            data_dir=args.data_dir,
+            max_frames=args.max_frames,
+            random_crop=True,
+            use_landmarks=False,
+            return_path=False,
+            enable_fallback=True,
         )
-
-        for key in totals:
-            totals[key] += float(metrics[key].detach().cpu())
-        processed_batches += 1
-        pbar.set_postfix(
-            loss=f"{float(metrics['loss']):.5f}",
-            l1=f"{float(metrics['l1']):.5f}",
-            mean=f"{float(metrics['mean_l1']):.5f}",
-            std=f"{float(metrics['recon_std']):.4f}",
-            motion=f"{float(metrics['motion_ratio']):.3f}",
-        )
-
-        # Save comparative plot for the first validation sample of each epoch
-        if not plotted and plot_dir is not None:
-            plot_path = plot_dir / f"reconstruction_epoch_{epoch:04d}.png"
-            save_reconstruction_plot(video[0], mouth_gt[0], mouth_recon[0], plot_path, epoch, mouth_roi)
-            plotted = True
-
-        if is_snn:
-            reset_snn_net(model)
-
-    return {key: value / max(1, processed_batches) for key, value in totals.items()}
-
-
-def main(args: argparse.Namespace) -> None:
-    seed_everything(args.seed)
-    
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Override __getitem__ to return only mouth crop? Actually VNLipDatasetV2 returns (video, landmarks, target)
+        # We'll create a wrapper to crop mouth and ignore other outputs
+        class Wrapper(Dataset):
+            def __init__(self, ds, roi):
+                self.ds = ds
+                self.roi = roi
+            def __len__(self):
+                return len(self.ds)
+            def __getitem__(self, idx):
+                video, _, _ = self.ds[idx]  # video: (C, T, H, W)
+                y1,y2,x1,x2 = self.roi
+                mouth = video[:, :, :, y1:y2, x1:x2]
+                return mouth
+        dataset = Wrapper(dataset, tuple(args.mouth_roi))
+        collate_fn = collate_pad_v2  # this collate expects (video, landmarks, target) but we only have video? Needs adjustment.
+        # Simpler: use fallback dataset that only loads video and crops.
+        print("Falling back to SimpleMouthDataset because collate mismatch.")
+        dataset = SimpleMouthDataset(args.data_dir, tuple(args.mouth_roi), args.max_frames)
+        collate_fn = collate_byol
     else:
-        device = torch.device(args.device)
-    print(f"[device] Using device: {device}")
+        dataset = SimpleMouthDataset(args.data_dir, tuple(args.mouth_roi), args.max_frames)
+        collate_fn = collate_byol
 
-    # Setup directories
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    plot_dir = output_dir / "ssl_plots"
-    plot_dir.mkdir(parents=True, exist_ok=True)
-
-    # Resolve data path
-    data_path = Path(args.data_dir)
-    if not data_path.is_absolute():
-        data_path = PROJECT_ROOT / data_path
-    print(f"[data] Data directory resolved to: {safe_text(data_path)}")
-    mouth_roi = parse_mouth_roi(args.mouth_roi)
-    roi_h = mouth_roi[1] - mouth_roi[0]
-    roi_w = mouth_roi[3] - mouth_roi[2]
-    print(f"[mouth-roi] y={mouth_roi[0]}:{mouth_roi[1]} x={mouth_roi[2]}:{mouth_roi[3]} size={roi_h}x{roi_w}")
-    print(f"[ssl-input] mode={args.input_mode} mask_fill={args.mask_fill}")
-
-    # 1. Dataset Loading
-    # Disable landmarks and targets to save RAM and time
-    print("[data] Loading VNLipDatasetV2...")
-    dataset = VNLipDatasetV2(
-        data_dir=str(data_path),
-        max_frames=args.max_frames,
-        random_crop=args.random_crop,
-        use_landmarks=False,  # VERY IMPORTANT: Disabling landmarks saves 90% of preprocessing
-        return_path=False,
-        enable_fallback=not args.disable_fallback,
-    )
-
-    if args.limit:
-        limit = max(1, min(int(args.limit), len(dataset)))
-        print(f"[data] Limiting dataset to first {limit} samples.")
-        split_dataset = Subset(dataset, list(range(limit)))
-    else:
-        split_dataset = dataset
-
-    total = len(split_dataset)
-    val_count = max(1, int(round(total * args.val_ratio))) if total > 1 else 0
-    train_count = total - val_count
-    
-    generator = torch.Generator().manual_seed(args.seed)
-    if val_count > 0:
-        train_set, val_set = random_split(split_dataset, [train_count, val_count], generator=generator)
-    else:
-        train_set, val_set = split_dataset, None
-
-    if args.repeat_factor > 1:
-        train_set = ConcatDataset([train_set] * args.repeat_factor)
-        print(f"[data] Repeating train split {args.repeat_factor}x -> optimizer_steps_per_epoch={len(train_set)}")
-
-    print(f"[data] Splits: train={len(train_set)}, val={len(val_set) if val_set else 0}")
-
-    train_loader = DataLoader(
-        train_set,
+    dataloader = DataLoader(
+        dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=0,
         pin_memory=torch.cuda.is_available(),
-        collate_fn=collate_pad_v2,
+        collate_fn=collate_fn
     )
-    
-    val_loader = None
-    if val_set is not None:
-        val_loader = DataLoader(
-            val_set,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=torch.cuda.is_available(),
-            collate_fn=collate_pad_v2,
-        )
+    print(f"Dataset size: {len(dataset)}")
 
-    # 2. Build Models
-    visual_encoder = build_visual_encoder(args.encoder_type).to(device)
-    decoder = build_ssl_decoder(args, out_size=(roi_h, roi_w)).to(device)
-    model = SSLAutoencoder(visual_encoder, decoder).to(device)
+    # 2. Build base encoder (ResNet2+1D)
+    if USE_FACTORY:
+        base_encoder = build_encoder(args.encoder_type).to(device)
+    else:
+        # If build_encoder not available, you need to define your (2+1)D encoder here.
+        # For now, raise error.
+        raise ImportError("build_encoder not available. Please ensure src.models.encoders.factory exists or manually define your ResNet2+1D.")
+    print(f"Base encoder built: {args.encoder_type}")
 
-    if args.freeze_encoder:
-        for param in model.visual_encoder.parameters():
-            param.requires_grad = False
-        print("[freeze] visual_encoder frozen; training SSL decoder only.")
+    # 3. BYOL model
+    byol = BYOL(base_encoder, momentum=args.momentum).to(device)
 
-    is_snn = args.encoder_type.lower() == "snn"
-    if is_snn:
-        print("[SNN] Parametric LIF / LIF Nodes enabled with Surrogate Gradients (ATan).")
+    # 4. Optimizer
+    optimizer = torch.optim.AdamW(byol.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    # Multi-GPU support
-    if device.type == "cuda" and torch.cuda.device_count() > 1:
-        print(f"[device] Multi-GPU Active: {torch.cuda.device_count()}x GPUs utilized. Wrapping model!")
-        model = torch.nn.DataParallel(model)
+    # 5. Train
+    pretrained_encoder = train_byol(
+        model=byol,
+        dataloader=dataloader,
+        optimizer=optimizer,
+        device=device,
+        epochs=args.epochs,
+        checkpoint_dir=args.output_dir,
+    )
 
-    # 3. Optimization Setup
-    encoder_lr = args.lr if args.lr is not None else args.encoder_lr
-    decoder_lr = args.lr if args.lr is not None else args.decoder_lr
-    optim_model = model.module if hasattr(model, "module") else model
-    optimizer_groups = []
-    encoder_params = [p for p in optim_model.visual_encoder.parameters() if p.requires_grad]
-    if encoder_params:
-        optimizer_groups.append({"params": encoder_params, "lr": encoder_lr})
-    optimizer_groups.append({"params": optim_model.decoder.parameters(), "lr": decoder_lr})
-    optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=args.weight_decay)
-    scheduler = None
-    if args.scheduler == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and args.amp)
-
-    # 4. Training Loop
-    best_val_loss = float("inf")
-    print(f"\n--- Starting SSL Mouth-Patch Pre-training for {args.encoder_type.upper()} ({args.epochs} epochs) ---")
-    print(f"[lr] encoder_lr={encoder_lr:.2e} decoder_lr={decoder_lr:.2e}")
-    
-    for epoch in range(1, args.epochs + 1):
-        epoch_start = time.time()
-        
-        train_loss = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            device=device,
-            scaler=scaler,
-            accum_steps=args.accum_steps,
-            is_snn=is_snn,
-            amp=args.amp,
-            mouth_roi=mouth_roi,
-            input_mode=args.input_mode,
-            mask_fill=args.mask_fill,
-            mse_weight=args.mse_weight,
-            temporal_weight=args.temporal_weight,
-            edge_weight=args.edge_weight,
-            motion_weight=args.motion_weight,
-            tv_weight=args.tv_weight,
-            max_grad_norm=args.max_grad_norm,
-        )
-
-        val_metrics = None
-        if val_loader is not None:
-            val_metrics = evaluate(
-                model=model,
-                loader=val_loader,
-                device=device,
-                is_snn=is_snn,
-                epoch=epoch,
-                plot_dir=plot_dir,
-                mouth_roi=mouth_roi,
-                input_mode=args.input_mode,
-                mask_fill=args.mask_fill,
-                mse_weight=args.mse_weight,
-                temporal_weight=args.temporal_weight,
-                edge_weight=args.edge_weight,
-                motion_weight=args.motion_weight,
-                tv_weight=args.tv_weight,
-            )
-        elif args.plot_train_every > 0 and (epoch % args.plot_train_every == 0 or epoch == 1 or epoch == args.epochs):
-            save_train_reconstruction_sample(
-                model=model,
-                loader=train_loader,
-                device=device,
-                is_snn=is_snn,
-                epoch=epoch,
-                plot_dir=plot_dir,
-                mouth_roi=mouth_roi,
-                input_mode=args.input_mode,
-                mask_fill=args.mask_fill,
-            )
-
-        if scheduler is not None:
-            scheduler.step()
-        elapsed = time.time() - epoch_start
-        current_lr = scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
-        
-        train_loss_value = train_loss["loss"]
-        val_loss_value = val_metrics["loss"] if val_metrics is not None else None
-        val_text = f"{val_loss_value:.6f}" if val_loss_value is not None else "n/a"
-        print(
-            f"[epoch {epoch:03d}] train={train_loss_value:.6f} val={val_text} "
-            f"train_l1={train_loss['l1']:.5f} mean_l1={train_loss['mean_l1']:.5f} "
-            f"recon_std={train_loss['recon_std']:.5f} train_motion={train_loss['motion_ratio']:.3f} "
-            f"gt_motion={train_loss['gt_motion']:.5f} recon_motion={train_loss['recon_motion']:.5f} "
-            f"| time={elapsed:.1f}s | lr={current_lr:.2e}"
-        )
-        if val_metrics is not None:
-            print(
-                f"  [val-metrics] l1={val_metrics['l1']:.5f} mean_l1={val_metrics['mean_l1']:.5f} "
-                f"recon_std={val_metrics['recon_std']:.5f} temporal={val_metrics['temporal']:.5f} "
-                f"edge={val_metrics['edge']:.5f} motion_mag={val_metrics['motion_mag']:.5f} "
-                f"tv={val_metrics['tv']:.5f} motion_ratio={val_metrics['motion_ratio']:.3f}"
-            )
-
-        # Save checkpoints
-        score = val_loss_value if val_loss_value is not None else train_loss_value
-        is_best = score < best_val_loss
-        if is_best:
-            best_val_loss = score
-            
-            unwrapped_model = model.module if hasattr(model, "module") else model
-            visual_state = unwrapped_model.visual_encoder.state_dict()
-            backbone_state = None
-            if hasattr(unwrapped_model.visual_encoder, "backbone"):
-                backbone_state = unwrapped_model.visual_encoder.backbone.state_dict()
-            
-            checkpoint_name = f"pretrain_visual_encoder_{args.encoder_type.lower()}_ssl_mouth_patch_{args.ssl_decoder.lower()}.pth"
-            checkpoint_path = output_dir / checkpoint_name
-            torch.save({
-                "epoch": epoch,
-                "visual_encoder": visual_state,
-                "backbone": backbone_state,
-                "mouth_decoder": unwrapped_model.decoder.state_dict(),
-                "autoencoder_state_dict": unwrapped_model.state_dict(),
-                "val_loss": val_loss_value,
-                "train_loss": train_loss_value,
-                "train_metrics": train_loss,
-                "val_metrics": val_metrics,
-                "mouth_roi": mouth_roi,
-                "config": vars(args),
-                "ssl_decoder_type": args.ssl_decoder,
-            }, checkpoint_path)
-            print(f"  -> Best mouth-patch model checkpoint saved to: {safe_text(checkpoint_path)}")
-
-        # Clean cache
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        gc.collect()
-
-    print(f"\n[done] SSL Mouth-Patch Pre-training successfully completed! Best loss: {best_val_loss:.6f}")
+    # 6. Save final encoder weights only (for downstream mel reconstruction)
+    final_encoder_path = os.path.join(args.output_dir, "pretrained_encoder_resnet2plus1d.pth")
+    torch.save(pretrained_encoder.state_dict(), final_encoder_path)
+    print(f"Pretrained encoder saved to {final_encoder_path}")
+    print("BYOL pretraining completed.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Self-Supervised Pre-training for Silent Video Encoder (Aligned Mouth Patch).")
-    parser.add_argument("--data-dir", default=default_data_dir(), help="Data directory containing .pt files.")
-    parser.add_argument("--output-dir", default="checkpoints_modular", help="Checkpoint output directory.")
-    parser.add_argument("--encoder-type", default="non_snn", choices=["non_snn", "nonsnn", "snn", "resnet18_temporal"], help="Backbone encoder to pretrain.")
-    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--epochs", type=int, default=20, help="Number of SSL epochs.")
-    parser.add_argument("--batch-size", type=int, default=4, help="Batch size per forward pass.")
-    parser.add_argument("--accum-steps", type=int, default=1, help="Steps for gradient accumulation.")
-    parser.add_argument("--lr", type=float, default=None, help="Optional shared learning rate override.")
-    parser.add_argument("--encoder-lr", type=float, default=1e-4, help="Learning rate for the visual encoder.")
-    parser.add_argument("--decoder-lr", type=float, default=1e-4, help="Learning rate for the SSL mouth decoder.")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay.")
-    parser.add_argument("--scheduler", default="cosine", choices=["cosine", "none"], help="LR scheduler. Use 'none' for overfit/debug runs.")
-    parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping norm. Use 0 to disable.")
-    parser.add_argument("--max-frames", type=int, default=60, help="Maximum video frames per sample.")
-    parser.add_argument("--random-crop", default=True, action=argparse.BooleanOptionalAction, help="Randomly crop temporal windows when video_len > max_frames.")
-    parser.add_argument("--repeat-factor", type=int, default=1, help="Repeat train split to get more optimizer steps per epoch, useful for overfit tests.")
-    parser.add_argument("--freeze-encoder", action="store_true", help="Freeze visual encoder and train only the SSL decoder.")
-    parser.add_argument("--val-ratio", type=float, default=0.1, help="Validation split ratio.")
-    parser.add_argument("--limit", type=int, default=None, help="Limit number of samples for dry-run.")
-    parser.add_argument("--num-workers", type=int, default=0, help="Dataloader workers.")
-    parser.add_argument("--amp", action="store_true", help="Enable Automatic Mixed Precision.")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--mouth-roi", nargs=4, type=int, default=[45, 80, 32, 80], metavar=("Y1", "Y2", "X1", "X2"))
-    parser.add_argument("--input-mode", default="mouth_mask", choices=["full", "mouth_mask", "mouth_crop"], help="Visual input used for SSL pretraining.")
-    parser.add_argument("--mask-fill", type=float, default=0.0, help="Fill value outside mouth ROI when --input-mode=mouth_mask.")
-    parser.add_argument("--mse-weight", type=float, default=0.25)
-    parser.add_argument("--temporal-weight", type=float, default=1.0)
-    parser.add_argument("--edge-weight", type=float, default=0.5)
-    parser.add_argument("--motion-weight", type=float, default=10.0)
-    parser.add_argument("--tv-weight", type=float, default=0.2)
-    parser.add_argument("--ssl-decoder", default="finer", choices=["finer", "conv"], help="SSL-only mouth patch decoder type.")
-    parser.add_argument("--decoder-base-channels", type=int, default=192)
-    parser.add_argument("--finer-hidden-dim", type=int, default=192)
-    parser.add_argument("--finer-layers", type=int, default=4)
-    parser.add_argument("--finer-omega", type=float, default=10.0)
-    parser.add_argument("--plot-train-every", type=int, default=1, help="When no val split exists, save a train reconstruction plot every N epochs.")
-    parser.add_argument("--disable-fallback", default=True, action=argparse.BooleanOptionalAction, help="Disable dataset fallback replacement during aligned SSL pretrain.")
-
-    main(parser.parse_args())
+    main()
