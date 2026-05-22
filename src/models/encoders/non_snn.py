@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
+import torchvision.models as models
 
 class NonSpikingDirectEncoder(nn.Module):
     def __init__(self, in_channels=1, out_channels=64):
@@ -181,6 +182,60 @@ class NonSpikingViTEncoder(nn.Module):
         if features.size(1) > self.pos_embedding.size(1):
             raise ValueError(f"T={features.size(1)} v??t T_max={self.pos_embedding.size(1)}")
         features = features + self.pos_embedding[:, :features.size(1), :]
+        features = self.temporal(features)
+        return self.norm(features)
+
+class ResNet18TemporalEncoder(nn.Module):
+    def __init__(self, z_dim=512, n_heads=8, n_blocks=4, mlp_hidden_dim=2048, T_max=1000, dropout=0.1, pretrained=True):
+        super().__init__()
+        if pretrained:
+            try:
+                from torchvision.models import ResNet18_Weights
+                self.backbone_2d = models.resnet18(weights=ResNet18_Weights.DEFAULT)
+                print("[ResNet18 Backbone] Loaded pretrained ResNet18 weights from ResNet18_Weights.DEFAULT")
+            except Exception:
+                self.backbone_2d = models.resnet18(pretrained=True)
+                print("[ResNet18 Backbone] Loaded pretrained ResNet18 weights via pretrained=True")
+        else:
+            self.backbone_2d = models.resnet18(pretrained=False)
+            print("[ResNet18 Backbone] Initialized ResNet18 without pretraining")
+            
+        # Replace fully connected classification layer with Identity
+        self.backbone_2d.fc = nn.Identity()
+        
+        self.pos_embedding = nn.Parameter(torch.randn(1, T_max, z_dim) * 0.02)
+        self.temporal = NonSpikingTemporalEncoder(
+            z_dim=z_dim,
+            n_heads=n_heads,
+            n_blocks=n_blocks,
+            mlp_hidden_dim=mlp_hidden_dim,
+            dropout=dropout,
+        )
+        self.norm = nn.LayerNorm(z_dim)
+
+    def forward(self, X: Tensor) -> Tensor:
+        # Input shape: (B, 1, T, H, W)
+        B, C, T, H, W = X.shape
+        if C == 1:
+            # Replicate grayscale channel to 3 channels for ImageNet-pretrained ResNet-18
+            X = X.repeat(1, 3, 1, 1, 1)
+            C = 3
+            
+        # Reshape to 2D frames of shape (B*T, 3, H, W)
+        X_2d = X.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+        
+        # Spatial feature extraction: (B*T, 512)
+        features = self.backbone_2d(X_2d)
+        
+        # Reshape back to sequence: (B, T, 512)
+        features = features.reshape(B, T, 512)
+        
+        # Add positional embedding
+        if features.size(1) > self.pos_embedding.size(1):
+            raise ValueError(f"T={features.size(1)} exceeds T_max={self.pos_embedding.size(1)}")
+        features = features + self.pos_embedding[:, :features.size(1), :]
+        
+        # Temporal attention
         features = self.temporal(features)
         return self.norm(features)
 

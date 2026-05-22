@@ -291,6 +291,15 @@ class VNLipDatasetV2(Dataset):
             raise RuntimeError(f"Khong co file .pt trong {self.data_dir}")
 
         # Pre-scan first file for landmark shape
+
+        if not os.path.isdir(self.data_dir):
+            raise FileNotFoundError(f"Khong tim thay data_dir: {self.data_dir}")
+
+        self.files = sorted(f for f in os.listdir(self.data_dir) if f.endswith(".pt"))
+        if len(self.files) == 0:
+            raise RuntimeError(f"Khong co file .pt trong {self.data_dir}")
+
+        # Pre-scan first file for landmark shape
         if self.use_landmarks:
             sample_path = os.path.join(self.data_dir, self.files[0])
             sample = torch.load(sample_path, map_location="cpu", weights_only=False)
@@ -388,10 +397,18 @@ class VNLipDatasetV2(Dataset):
         return full_frames
 
     def _crop(self, video, target, target_len, landmarks=None, data=None):
-        video_len = int(data.get("video_len", video.shape[1])) if data else video.shape[1]
-        video_len = min(video_len, video.shape[1])
+        is_features = (video.dim() == 2)  # (T, D) shape
+        raw_video_len = video.shape[0] if is_features else video.shape[1]
+        
+        video_len = int(data.get("video_len", raw_video_len)) if data else raw_video_len
+        video_len = min(video_len, raw_video_len)
         target_len = min(int(target_len), target.shape[0])
-        video = video[:, :video_len]
+        
+        if is_features:
+            video = video[:video_len]
+        else:
+            video = video[:, :video_len]
+            
         target = target[:target_len]
         if landmarks is not None:
             landmarks = landmarks[:video_len]
@@ -410,7 +427,11 @@ class VNLipDatasetV2(Dataset):
         target_end = int(round(end * ratio))
         target_end = max(target_start + 1, min(target_end, target_len))
 
-        video = video[:, start:end]
+        if is_features:
+            video = video[start:end]
+        else:
+            video = video[:, start:end]
+            
         target = target[target_start:target_end]
         if landmarks is not None:
             landmarks = landmarks[start:end]
@@ -420,25 +441,35 @@ class VNLipDatasetV2(Dataset):
         file_name = self.files[idx]
         file_path = os.path.join(self.data_dir, file_name)
         data = torch.load(file_path, map_location="cpu", weights_only=False)
-        video = data["video"].float()
         target, target_len = self._get_target(data, file_path)
 
-        if video.dim() == 3:
-            video = video.unsqueeze(0)
-        if video.dim() != 4 or target.dim() != 2:
-            raise ValueError(
-                f"Sai shape trong {file_path}: video={tuple(video.shape)}, target={tuple(target.shape)}"
-            )
+        # --- Check if using pre-extracted SOTA visual features ---
+        use_offline = self.use_offline_features and "visual_feature" in data
+        
+        if use_offline:
+            video = data["visual_feature"].float()  # (T, 512)
+            if video.dim() != 2:
+                raise ValueError(
+                    f"Sai shape visual_feature trong {file_path}: expected 2D (T, 512), got {tuple(video.shape)}"
+                )
+        else:
+            video = data["video"].float()
+            if video.dim() == 3:
+                video = video.unsqueeze(0)
+            if video.dim() != 4 or target.dim() != 2:
+                raise ValueError(
+                    f"Sai shape trong {file_path}: video={tuple(video.shape)}, target={tuple(target.shape)}"
+                )
 
-        # --- Optional full-frame visual input ---
-        if self.force_full_frame:
-            video = self._apply_full_frame_input(video, file_name)
+            # --- Optional full-frame visual input ---
+            if self.force_full_frame:
+                video = self._apply_full_frame_input(video, file_name)
 
-        # --- Fallback for lost frames ---
-        if self.enable_fallback and not self.force_full_frame:
-            lost_mask = self._detect_lost_frames(video)
-            if lost_mask.any():
-                video = self._apply_fallback(video, lost_mask, file_name)
+            # --- Fallback for lost frames ---
+            if self.enable_fallback and not self.force_full_frame:
+                lost_mask = self._detect_lost_frames(video)
+                if lost_mask.any():
+                    video = self._apply_fallback(video, lost_mask, file_name)
 
         # --- Landmarks ---
         landmarks = None
@@ -460,10 +491,12 @@ class VNLipDatasetV2(Dataset):
             return video, target, file_path
         return video, target
 
+
 def collate_pad_v2(batch):
     """
     Collate function that pads variable-length sequences.
     Handles landmarks with 6 channels (x, y, dx, dy, d2x, d2y).
+    Supports visual feature sequences (T, 512) and raw videos (C, T, H, W).
     """
     has_path = isinstance(batch[0][-1], str)
     # Detect landmarks: 4D tensor with last dim = 6 or 2
@@ -486,7 +519,8 @@ def collate_pad_v2(batch):
         landmarks = None
         paths = None
 
-    video_lengths = torch.tensor([v.shape[1] for v in videos], dtype=torch.long)
+    # Detect if we are using 2D visual features (T, 512) or 4D raw videos (C, T, H, W)
+    video_lengths = torch.tensor([v.shape[0] if v.dim() == 2 else v.shape[1] for v in videos], dtype=torch.long)
     target_lengths = torch.tensor([t.shape[0] for t in targets], dtype=torch.long)
     T_video_max = int(video_lengths.max().item())
     T_target_max = int(target_lengths.max().item())
@@ -496,14 +530,24 @@ def collate_pad_v2(batch):
     padded_landmarks = []
 
     for i, (v, t) in enumerate(zip(videos, targets)):
-        v_len = v.shape[1]
+        is_features = (v.dim() == 2)
+        v_len = v.shape[0] if is_features else v.shape[1]
         t_len = t.shape[0]
+        
         if v_len < T_video_max:
-            pad_v = torch.zeros(v.shape[0], T_video_max - v_len, v.shape[2], v.shape[3], dtype=v.dtype)
-            v = torch.cat([v, pad_v], dim=1)
+            if is_features:
+                # pad features: (T, 512) -> (T_max, 512)
+                pad_v = torch.zeros(T_video_max - v_len, v.shape[1], dtype=v.dtype)
+                v = torch.cat([v, pad_v], dim=0)
+            else:
+                # pad raw video: (C, T, H, W) -> (C, T_max, H, W)
+                pad_v = torch.zeros(v.shape[0], T_video_max - v_len, v.shape[2], v.shape[3], dtype=v.dtype)
+                v = torch.cat([v, pad_v], dim=1)
+                
         if t_len < T_target_max:
             pad_t = torch.zeros(T_target_max - t_len, t.shape[1], dtype=t.dtype)
             t = torch.cat([t, pad_t], dim=0)
+            
         padded_videos.append(v)
         padded_targets.append(t)
 
@@ -530,4 +574,3 @@ def collate_pad_v2(batch):
     if has_path:
         return video_batches, target_batches, target_lengths, list(paths)
     return video_batches, target_batches, target_lengths
-

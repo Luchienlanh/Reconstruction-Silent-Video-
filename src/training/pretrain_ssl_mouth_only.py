@@ -179,11 +179,10 @@ class FINERMouthINRDecoder(nn.Module):
         # Generates scale (gamma) and shift (beta) for all layers
         self.film_gen = nn.Linear(z_dim, num_layers * 2 * hidden_dim)
         with torch.no_grad():
-            # "Perfect Initialization": Initialize weight and bias to EXACTLY 0.0.
-            # This forces initial gammas and betas to be 0.0, making all reconstructed frames
-            # initially 100% identical. This zeroes out initial recon_motion and motion_ratio,
-            # allowing the network to focus on learning the average static mouth shape first.
-            self.film_gen.weight.data.zero_()
+            # Initialize weight using a small standard normal distribution (std=0.01)
+            # instead of EXACTLY 0.0, which kills all gradient flow back to the visual encoder.
+            # A small random initialization ensures robust gradient flow while keeping initial motion low.
+            self.film_gen.weight.data.normal_(0.0, 0.01)
             self.film_gen.bias.data.zero_()
 
         # List of modulated FINER layers
@@ -906,7 +905,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Self-Supervised Pre-training for Silent Video Encoder (Aligned Mouth Patch).")
     parser.add_argument("--data-dir", default=default_data_dir(), help="Data directory containing .pt files.")
     parser.add_argument("--output-dir", default="checkpoints_modular", help="Checkpoint output directory.")
-    parser.add_argument("--encoder-type", default="non_snn", choices=["non_snn", "nonsnn", "snn"], help="Backbone encoder to pretrain.")
+    parser.add_argument("--encoder-type", default="non_snn", choices=["non_snn", "nonsnn", "snn", "resnet18_temporal"], help="Backbone encoder to pretrain.")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--epochs", type=int, default=20, help="Number of SSL epochs.")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size per forward pass.")

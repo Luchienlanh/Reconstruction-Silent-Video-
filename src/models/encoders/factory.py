@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 from .snn import SpikingViTEncoder
-from .non_snn import NonSpikingViTEncoder
+from .non_snn import NonSpikingViTEncoder, ResNet18TemporalEncoder
 
 def build_encoder(encoder_type="snn", **kwargs):
     encoder_type = encoder_type.lower()
@@ -21,6 +21,8 @@ def build_encoder(encoder_type="snn", **kwargs):
         return SpikingViTEncoder(**kwargs)
     if encoder_type in {"non_snn", "nonsnn", "cnn_transformer"}:
         return NonSpikingViTEncoder(**kwargs)
+    if encoder_type == "resnet18_temporal":
+        return ResNet18TemporalEncoder(**kwargs)
     raise ValueError(f"Unknown ENCODER_TYPE: {encoder_type}")
 
 class LandmarkEncoder(nn.Module):
