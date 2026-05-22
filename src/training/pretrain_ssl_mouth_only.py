@@ -171,7 +171,7 @@ class FINERMouthINRDecoder(nn.Module):
             ]
         )
         self.final_layer = nn.Linear(hidden_dim, out_channels)
-        nn.init.xavier_uniform_(self.final_layer.weight)
+        nn.init.normal_(self.final_layer.weight, mean=0.0, std=1e-4)
         nn.init.zeros_(self.final_layer.bias)
         self.output_bias = nn.Parameter(torch.zeros(1))
 
@@ -314,12 +314,23 @@ def sobel_edges(x: torch.Tensor) -> torch.Tensor:
     return edge.reshape(b, c, t, h, w)
 
 
+def spatial_tv(x: torch.Tensor) -> torch.Tensor:
+    tv = x.new_tensor(0.0)
+    if x.shape[-1] > 1:
+        tv = tv + (x[..., :, 1:] - x[..., :, :-1]).abs().mean()
+    if x.shape[-2] > 1:
+        tv = tv + (x[..., 1:, :] - x[..., :-1, :]).abs().mean()
+    return tv
+
+
 def compute_reconstruction_metrics(
     mouth_recon: torch.Tensor,
     mouth_gt: torch.Tensor,
     mse_weight: float,
     temporal_weight: float,
     edge_weight: float,
+    motion_weight: float,
+    tv_weight: float,
 ) -> dict[str, torch.Tensor]:
     loss_l1 = F.l1_loss(mouth_recon, mouth_gt)
     loss_mse = F.mse_loss(mouth_recon, mouth_gt)
@@ -331,14 +342,26 @@ def compute_reconstruction_metrics(
         gt_motion = diff_gt.abs().mean()
         recon_motion = diff_recon.abs().mean()
         motion_ratio = recon_motion / gt_motion.clamp_min(1e-6)
+        loss_motion_mag = F.l1_loss(recon_motion, gt_motion.detach())
     else:
         loss_temporal = mouth_gt.new_tensor(0.0)
         gt_motion = mouth_gt.new_tensor(0.0)
         recon_motion = mouth_gt.new_tensor(0.0)
         motion_ratio = mouth_gt.new_tensor(0.0)
+        loss_motion_mag = mouth_gt.new_tensor(0.0)
 
     loss_edge = F.l1_loss(sobel_edges(mouth_recon), sobel_edges(mouth_gt))
-    loss = loss_l1 + mse_weight * loss_mse + temporal_weight * loss_temporal + edge_weight * loss_edge
+    recon_tv = spatial_tv(mouth_recon)
+    gt_tv = spatial_tv(mouth_gt)
+    loss_tv = F.l1_loss(recon_tv, gt_tv.detach())
+    loss = (
+        loss_l1
+        + mse_weight * loss_mse
+        + temporal_weight * loss_temporal
+        + edge_weight * loss_edge
+        + motion_weight * loss_motion_mag
+        + tv_weight * loss_tv
+    )
 
     return {
         "loss": loss,
@@ -346,6 +369,8 @@ def compute_reconstruction_metrics(
         "mse": loss_mse,
         "temporal": loss_temporal,
         "edge": loss_edge,
+        "motion_mag": loss_motion_mag,
+        "tv": loss_tv,
         "gt_motion": gt_motion,
         "recon_motion": recon_motion,
         "motion_ratio": motion_ratio,
@@ -423,6 +448,8 @@ def train_one_epoch(
     mse_weight: float,
     temporal_weight: float,
     edge_weight: float,
+    motion_weight: float,
+    tv_weight: float,
     max_grad_norm: float,
 ) -> dict[str, float]:
     model.train()
@@ -432,6 +459,8 @@ def train_one_epoch(
         "mse": 0.0,
         "temporal": 0.0,
         "edge": 0.0,
+        "motion_mag": 0.0,
+        "tv": 0.0,
         "gt_motion": 0.0,
         "recon_motion": 0.0,
         "motion_ratio": 0.0,
@@ -461,6 +490,8 @@ def train_one_epoch(
                     mse_weight=mse_weight,
                     temporal_weight=temporal_weight,
                     edge_weight=edge_weight,
+                    motion_weight=motion_weight,
+                    tv_weight=tv_weight,
                 )
                 loss = metrics["loss"] / accum_steps
 
@@ -542,6 +573,8 @@ def evaluate(
     mse_weight: float,
     temporal_weight: float,
     edge_weight: float,
+    motion_weight: float,
+    tv_weight: float,
 ) -> dict[str, float]:
     model.eval()
     totals = {
@@ -550,6 +583,8 @@ def evaluate(
         "mse": 0.0,
         "temporal": 0.0,
         "edge": 0.0,
+        "motion_mag": 0.0,
+        "tv": 0.0,
         "gt_motion": 0.0,
         "recon_motion": 0.0,
         "motion_ratio": 0.0,
@@ -576,6 +611,8 @@ def evaluate(
             mse_weight=mse_weight,
             temporal_weight=temporal_weight,
             edge_weight=edge_weight,
+            motion_weight=motion_weight,
+            tv_weight=tv_weight,
         )
 
         for key in totals:
@@ -727,6 +764,8 @@ def main(args: argparse.Namespace) -> None:
             mse_weight=args.mse_weight,
             temporal_weight=args.temporal_weight,
             edge_weight=args.edge_weight,
+            motion_weight=args.motion_weight,
+            tv_weight=args.tv_weight,
             max_grad_norm=args.max_grad_norm,
         )
 
@@ -745,6 +784,8 @@ def main(args: argparse.Namespace) -> None:
                 mse_weight=args.mse_weight,
                 temporal_weight=args.temporal_weight,
                 edge_weight=args.edge_weight,
+                motion_weight=args.motion_weight,
+                tv_weight=args.tv_weight,
             )
         elif args.plot_train_every > 0 and (epoch % args.plot_train_every == 0 or epoch == 1 or epoch == args.epochs):
             save_train_reconstruction_sample(
@@ -774,7 +815,8 @@ def main(args: argparse.Namespace) -> None:
         if val_metrics is not None:
             print(
                 f"  [val-metrics] l1={val_metrics['l1']:.5f} temporal={val_metrics['temporal']:.5f} "
-                f"edge={val_metrics['edge']:.5f} motion_ratio={val_metrics['motion_ratio']:.3f}"
+                f"edge={val_metrics['edge']:.5f} motion_mag={val_metrics['motion_mag']:.5f} "
+                f"tv={val_metrics['tv']:.5f} motion_ratio={val_metrics['motion_ratio']:.3f}"
             )
 
         # Save checkpoints
@@ -826,7 +868,7 @@ if __name__ == "__main__":
     parser.add_argument("--accum-steps", type=int, default=1, help="Steps for gradient accumulation.")
     parser.add_argument("--lr", type=float, default=None, help="Optional shared learning rate override.")
     parser.add_argument("--encoder-lr", type=float, default=1e-4, help="Learning rate for the visual encoder.")
-    parser.add_argument("--decoder-lr", type=float, default=5e-4, help="Learning rate for the SSL mouth decoder.")
+    parser.add_argument("--decoder-lr", type=float, default=1e-4, help="Learning rate for the SSL mouth decoder.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay.")
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping norm. Use 0 to disable.")
     parser.add_argument("--max-frames", type=int, default=60, help="Maximum video frames per sample.")
@@ -839,13 +881,15 @@ if __name__ == "__main__":
     parser.add_argument("--input-mode", default="mouth_mask", choices=["full", "mouth_mask", "mouth_crop"], help="Visual input used for SSL pretraining.")
     parser.add_argument("--mask-fill", type=float, default=0.0, help="Fill value outside mouth ROI when --input-mode=mouth_mask.")
     parser.add_argument("--mse-weight", type=float, default=0.25)
-    parser.add_argument("--temporal-weight", type=float, default=10.0)
+    parser.add_argument("--temporal-weight", type=float, default=1.0)
     parser.add_argument("--edge-weight", type=float, default=0.5)
+    parser.add_argument("--motion-weight", type=float, default=10.0)
+    parser.add_argument("--tv-weight", type=float, default=0.2)
     parser.add_argument("--ssl-decoder", default="finer", choices=["finer", "conv"], help="SSL-only mouth patch decoder type.")
     parser.add_argument("--decoder-base-channels", type=int, default=192)
     parser.add_argument("--finer-hidden-dim", type=int, default=192)
     parser.add_argument("--finer-layers", type=int, default=4)
-    parser.add_argument("--finer-omega", type=float, default=30.0)
+    parser.add_argument("--finer-omega", type=float, default=10.0)
     parser.add_argument("--plot-train-every", type=int, default=1, help="When no val split exists, save a train reconstruction plot every N epochs.")
     parser.add_argument("--disable-fallback", default=True, action=argparse.BooleanOptionalAction, help="Disable dataset fallback replacement during aligned SSL pretrain.")
 
