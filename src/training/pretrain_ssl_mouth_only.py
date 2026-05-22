@@ -11,13 +11,12 @@ import random
 import argparse
 import copy
 from pathlib import Path
-from collections.abc import Sequence
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Subset, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
 
 # Add project paths
@@ -30,7 +29,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # Try to import existing dataset and encoder factory
 try:
-    from src.data.dataset import VNLipDatasetV2, collate_pad_v2
+    from src.data.dataset import VNLipDatasetV2
     from src.models.encoders.factory import build_encoder
     USE_FACTORY = True
 except ImportError:
@@ -38,7 +37,7 @@ except ImportError:
     print("[WARN] Could not import src modules. Using fallback dataset and encoder.")
 
 
-# ========== Fallback dataset (fixed index error) ==========
+# ========== Fallback dataset ==========
 class SimpleMouthDataset(Dataset):
     """Load .pt files, crop mouth ROI, return video tensor (1, T, H_roi, W_roi)."""
     def __init__(self, data_dir, mouth_roi=(45,80,32,80), max_frames=30):
@@ -53,14 +52,11 @@ class SimpleMouthDataset(Dataset):
     def _load_video(self, path):
         data = torch.load(path, map_location='cpu', weights_only=False)
         video = data['video'].float()
-        # video shape: (C, T, H, W) with C=1, H=W=112
         if video.dim() == 3:
             video = video.unsqueeze(0)  # (1, T, H, W)
-        # Crop mouth ROI: video shape (C, T, H, W)
         y1, y2, x1, x2 = self.mouth_roi
         mouth = video[:, :, y1:y2, x1:x2]   # (1, T, H_roi, W_roi)
         T = mouth.shape[1]
-        # Adjust temporal length
         if T > self.max_frames:
             start = random.randint(0, T - self.max_frames)
             mouth = mouth[:, start:start+self.max_frames]
@@ -122,16 +118,16 @@ def get_byol_augmentation():
     )
 
 
-# ========== BYOL components ==========
+# ========== BYOL components (using LayerNorm to support batch_size=1) ==========
 class BYOLProjector(nn.Module):
     def __init__(self, in_dim=512, hidden_dim=4096, out_dim=256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, out_dim),
-            nn.BatchNorm1d(out_dim, affine=False)
+            nn.LayerNorm(out_dim),
         )
     def forward(self, x):
         return self.net(x)
@@ -141,7 +137,7 @@ class BYOLPredictor(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, out_dim),
         )
@@ -176,7 +172,8 @@ class BYOL(nn.Module):
                 param_online.requires_grad = True
 
     def forward(self, x1, x2):
-        z1 = self.online_encoder(x1).mean(dim=1)
+        # x1, x2: (B, 1, T, H, W)
+        z1 = self.online_encoder(x1).mean(dim=1)   # (B, 512)
         z2 = self.online_encoder(x2).mean(dim=1)
         p1 = self.online_projector(z1)
         p2 = self.online_projector(z2)
@@ -209,7 +206,7 @@ def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
     for epoch in range(1, epochs+1):
         total_loss = 0.0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
-        for batch_idx, video in enumerate(pbar):
+        for video in pbar:
             video = video.to(device, non_blocking=True)
             with torch.amp.autocast('cuda', enabled=amp and device.type=='cuda'):
                 v1 = aug(video)
@@ -285,7 +282,6 @@ def main():
 
     # 1. Dataset
     if USE_FACTORY:
-        # Use VNLipDatasetV2 without landmarks/target
         base_ds = VNLipDatasetV2(
             data_dir=args.data_dir,
             max_frames=args.max_frames,
@@ -301,18 +297,11 @@ def main():
             def __len__(self):
                 return len(self.ds)
             def __getitem__(self, idx):
-                # VNLipDatasetV2 returns (video, target) when use_landmarks=False? Let's handle both.
                 result = self.ds[idx]
                 if isinstance(result, tuple):
-                    if len(result) == 2:
-                        video, _ = result
-                    elif len(result) == 3:
-                        video, _, _ = result
-                    else:
-                        raise ValueError(f"Unexpected tuple length: {len(result)}")
+                    video = result[0]
                 else:
                     video = result
-                # video shape: (C, T, H, W)
                 y1,y2,x1,x2 = self.roi
                 mouth = video[:, :, y1:y2, x1:x2]
                 return mouth
