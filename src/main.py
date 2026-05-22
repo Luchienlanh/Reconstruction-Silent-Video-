@@ -454,23 +454,38 @@ def run(args: argparse.Namespace) -> None:
             print(f"[pretrained-ssl] Loading weights from {safe_text(pretrained_ssl_path)}")
             checkpoint = torch.load(pretrained_ssl_path, map_location=device, weights_only=False)
             
-            # Check if checkpoint is the dict saved by pretrain_ssl.py
-            if isinstance(checkpoint, dict) and "backbone" in checkpoint:
-                state_dict = checkpoint["backbone"]
-            else:
-                state_dict = checkpoint
-            
-            # Target the backbone inside VisualLandmarkEncoderV2 -> ViTEncoder
-            # encoder.visual_encoder.backbone
-            if hasattr(encoder, "visual_encoder") and hasattr(encoder.visual_encoder, "backbone"):
-                missing_keys, unexpected_keys = encoder.visual_encoder.backbone.load_state_dict(state_dict, strict=False)
-                print(f"[pretrained-ssl] Backbone loaded successfully!")
+            if not hasattr(encoder, "visual_encoder"):
+                print("[pretrained-ssl] WARNING: Could not locate visual_encoder in encoder!")
+            elif isinstance(checkpoint, dict) and "visual_encoder" in checkpoint:
+                missing_keys, unexpected_keys = encoder.visual_encoder.load_state_dict(
+                    checkpoint["visual_encoder"],
+                    strict=False,
+                )
+                print("[pretrained-ssl] Visual encoder loaded successfully!")
+                if len(missing_keys) > 0:
+                    print(f"[pretrained-ssl] Missing keys (first 5): {missing_keys[:5]}")
+                if len(unexpected_keys) > 0:
+                    print(f"[pretrained-ssl] Unexpected keys (first 5): {unexpected_keys[:5]}")
+            elif isinstance(checkpoint, dict) and "backbone" in checkpoint and checkpoint["backbone"] is not None:
+                missing_keys, unexpected_keys = encoder.visual_encoder.backbone.load_state_dict(
+                    checkpoint["backbone"],
+                    strict=False,
+                )
+                print("[pretrained-ssl] Backbone loaded successfully!")
+                if len(missing_keys) > 0:
+                    print(f"[pretrained-ssl] Missing keys (first 5): {missing_keys[:5]}")
+                if len(unexpected_keys) > 0:
+                    print(f"[pretrained-ssl] Unexpected keys (first 5): {unexpected_keys[:5]}")
+            elif isinstance(checkpoint, dict) and all(torch.is_tensor(value) for value in checkpoint.values()):
+                target_state = checkpoint
+                missing_keys, unexpected_keys = encoder.visual_encoder.load_state_dict(target_state, strict=False)
+                print("[pretrained-ssl] Raw state dict loaded into visual encoder!")
                 if len(missing_keys) > 0:
                     print(f"[pretrained-ssl] Missing keys (first 5): {missing_keys[:5]}")
                 if len(unexpected_keys) > 0:
                     print(f"[pretrained-ssl] Unexpected keys (first 5): {unexpected_keys[:5]}")
             else:
-                print("[pretrained-ssl] WARNING: Could not locate visual_encoder.backbone in encoder!")
+                print("[pretrained-ssl] WARNING: Unsupported SSL checkpoint format.")
         else:
             print(f"[pretrained-ssl] WARNING: Pretrained SSL path {args.pretrained_ssl} does not exist or is not a file!")
 

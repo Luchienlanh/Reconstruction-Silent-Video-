@@ -96,9 +96,9 @@ class NonSpikingVidResNet(nn.Module):
         self.in_channels = 64
         self.stem = NonSpikingDirectEncoder(in_channels=1, out_channels=64)
         self.layer1 = self._make_layer(block, 64, conv_makers[0], layers[0], stride=1)
-        self.layer2 = self._make_layer(block, 128, conv_makers[1], layers[1], stride=1)
-        self.layer3 = self._make_layer(block, 256, conv_makers[2], layers[2], stride=1)
-        self.layer4 = self._make_layer(block, 512, conv_makers[3], layers[3], stride=1)
+        self.layer2 = self._make_layer(block, 128, conv_makers[1], layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, conv_makers[2], layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, conv_makers[3], layers[3], stride=2)
         self.avgpool = nn.AdaptiveAvgPool3d((None, 1, 1))
         self.fc = nn.Linear(512 * block.expansion, 512)
 
