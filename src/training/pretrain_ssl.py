@@ -91,9 +91,9 @@ class VideoDecoder3D(nn.Module):
             nn.SiLU(inplace=True),
         )
         
-        # Temporal smoothing 3D Convolution layer
+        # Temporal smoothing 3D Convolution layer with spatial-temporal integration
         self.temporal_conv = nn.Sequential(
-            nn.Conv3d(16, out_channels, kernel_size=(5, 1, 1), stride=(1, 1, 1), padding=(2, 0, 0)),
+            nn.Conv3d(16, out_channels, kernel_size=(5, 3, 3), stride=(1, 1, 1), padding=(2, 1, 1)),
             nn.Sigmoid()  # Normalize output pixels to [0.0, 1.0]
         )
 
@@ -234,10 +234,23 @@ def train_one_epoch(
                 # Reconstruct video pixels
                 recon_video = model(video)  # (B, 1, T, 112, 112)
                 
-                # Combine L1 Loss and MSE Loss for optimal detail + smoothness
-                loss_mse = F.mse_loss(recon_video, video)
-                loss_l1 = F.l1_loss(recon_video, video)
-                loss = loss_mse + 0.5 * loss_l1
+                # Combine L1 Loss and MSE Loss with Mouth-focused ROI Weighting + Temporal Difference Loss
+                # 1. Mouth ROI Focused Loss (y: 65 to 100, x: 32 to 80) - Tăng trọng số vùng miệng lên gấp 8 lần
+                loss_map_mse = (recon_video - video) ** 2
+                loss_map_l1 = torch.abs(recon_video - video)
+                
+                loss_map_mse[:, :, :, 65:100, 32:80] *= 8.0
+                loss_map_l1[:, :, :, 65:100, 32:80] *= 8.0
+                
+                loss_mse = loss_map_mse.mean()
+                loss_l1 = loss_map_l1.mean()
+                
+                # 2. Temporal Difference Loss (bắt buộc học chuyển động động học)
+                diff_gt = video[:, :, 1:] - video[:, :, :-1]
+                diff_recon = recon_video[:, :, 1:] - recon_video[:, :, :-1]
+                loss_temporal = F.l1_loss(diff_recon, diff_gt)
+                
+                loss = loss_mse + 0.5 * loss_l1 + 3.0 * loss_temporal
                 
                 # Normalize loss to account for gradient accumulation
                 loss = loss / accum_steps
@@ -296,9 +309,21 @@ def evaluate(
 
         recon_video = model(video)
         
-        loss_mse = F.mse_loss(recon_video, video)
-        loss_l1 = F.l1_loss(recon_video, video)
-        loss = loss_mse + 0.5 * loss_l1
+        # Weighted L1 & MSE + Temporal Diff
+        loss_map_mse = (recon_video - video) ** 2
+        loss_map_l1 = torch.abs(recon_video - video)
+        
+        loss_map_mse[:, :, :, 65:100, 32:80] *= 8.0
+        loss_map_l1[:, :, :, 65:100, 32:80] *= 8.0
+        
+        loss_mse = loss_map_mse.mean()
+        loss_l1 = loss_map_l1.mean()
+        
+        diff_gt = video[:, :, 1:] - video[:, :, :-1]
+        diff_recon = recon_video[:, :, 1:] - recon_video[:, :, :-1]
+        loss_temporal = F.l1_loss(diff_recon, diff_gt)
+        
+        loss = loss_mse + 0.5 * loss_l1 + 3.0 * loss_temporal
 
         total_loss += float(loss.detach().cpu())
         processed_batches += 1
