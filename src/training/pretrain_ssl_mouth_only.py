@@ -171,6 +171,25 @@ def crop_mouth(video: torch.Tensor, mouth_roi: tuple[int, int, int, int]) -> tor
     return video[:, :, :, y1:y2, x1:x2]
 
 
+def make_ssl_input(
+    video: torch.Tensor,
+    mouth_roi: tuple[int, int, int, int],
+    input_mode: str,
+    mask_fill: float,
+) -> torch.Tensor:
+    if input_mode == "full":
+        return video
+    mouth = crop_mouth(video, mouth_roi)
+    if input_mode == "mouth_mask":
+        masked = torch.full_like(video, float(mask_fill))
+        y1, y2, x1, x2 = mouth_roi
+        masked[:, :, :, y1:y2, x1:x2] = mouth
+        return masked
+    if input_mode == "mouth_crop":
+        return F.interpolate(mouth, size=(video.shape[2], 112, 112), mode="trilinear", align_corners=False)
+    raise ValueError(f"Unknown input_mode={input_mode}")
+
+
 def sobel_edges(x: torch.Tensor) -> torch.Tensor:
     b, c, t, h, w = x.shape
     flat = x.reshape(b * c * t, 1, h, w)
@@ -294,6 +313,8 @@ def train_one_epoch(
     is_snn: bool,
     amp: bool,
     mouth_roi: tuple[int, int, int, int],
+    input_mode: str,
+    mask_fill: float,
     mse_weight: float,
     temporal_weight: float,
     edge_weight: float,
@@ -324,7 +345,8 @@ def train_one_epoch(
 
         try:
             with torch.amp.autocast("cuda", enabled=amp):
-                mouth_recon = model(video)
+                ssl_input = make_ssl_input(video, mouth_roi, input_mode, mask_fill)
+                mouth_recon = model(ssl_input)
             mouth_gt = crop_mouth(video, mouth_roi)
 
             with torch.amp.autocast("cuda", enabled=False):
@@ -380,6 +402,8 @@ def save_train_reconstruction_sample(
     epoch: int,
     plot_dir: Path,
     mouth_roi: tuple[int, int, int, int],
+    input_mode: str,
+    mask_fill: float,
 ) -> None:
     model.eval()
     batch = next(iter(loader))
@@ -389,7 +413,8 @@ def save_train_reconstruction_sample(
     if is_snn:
         reset_snn_net(model)
 
-    mouth_recon = model(video)
+    ssl_input = make_ssl_input(video, mouth_roi, input_mode, mask_fill)
+    mouth_recon = model(ssl_input)
     mouth_gt = crop_mouth(video, mouth_roi)
     plot_path = plot_dir / f"train_reconstruction_epoch_{epoch:04d}.png"
     save_reconstruction_plot(video[0], mouth_gt[0], mouth_recon[0], plot_path, epoch, mouth_roi)
@@ -407,6 +432,8 @@ def evaluate(
     epoch: int,
     plot_dir: Path,
     mouth_roi: tuple[int, int, int, int],
+    input_mode: str,
+    mask_fill: float,
     mse_weight: float,
     temporal_weight: float,
     edge_weight: float,
@@ -435,7 +462,8 @@ def evaluate(
         if is_snn:
             reset_snn_net(model)
 
-        mouth_recon = model(video)
+        ssl_input = make_ssl_input(video, mouth_roi, input_mode, mask_fill)
+        mouth_recon = model(ssl_input)
         mouth_gt = crop_mouth(video, mouth_roi)
         metrics = compute_reconstruction_metrics(
             mouth_recon.float(),
@@ -490,6 +518,7 @@ def main(args: argparse.Namespace) -> None:
     roi_h = mouth_roi[1] - mouth_roi[0]
     roi_w = mouth_roi[3] - mouth_roi[2]
     print(f"[mouth-roi] y={mouth_roi[0]}:{mouth_roi[1]} x={mouth_roi[2]}:{mouth_roi[3]} size={roi_h}x{roi_w}")
+    print(f"[ssl-input] mode={args.input_mode} mask_fill={args.mask_fill}")
 
     # 1. Dataset Loading
     # Disable landmarks and targets to save RAM and time
@@ -593,6 +622,8 @@ def main(args: argparse.Namespace) -> None:
             is_snn=is_snn,
             amp=args.amp,
             mouth_roi=mouth_roi,
+            input_mode=args.input_mode,
+            mask_fill=args.mask_fill,
             mse_weight=args.mse_weight,
             temporal_weight=args.temporal_weight,
             edge_weight=args.edge_weight,
@@ -609,6 +640,8 @@ def main(args: argparse.Namespace) -> None:
                 epoch=epoch,
                 plot_dir=plot_dir,
                 mouth_roi=mouth_roi,
+                input_mode=args.input_mode,
+                mask_fill=args.mask_fill,
                 mse_weight=args.mse_weight,
                 temporal_weight=args.temporal_weight,
                 edge_weight=args.edge_weight,
@@ -622,6 +655,8 @@ def main(args: argparse.Namespace) -> None:
                 epoch=epoch,
                 plot_dir=plot_dir,
                 mouth_roi=mouth_roi,
+                input_mode=args.input_mode,
+                mask_fill=args.mask_fill,
             )
 
         scheduler.step()
@@ -633,6 +668,7 @@ def main(args: argparse.Namespace) -> None:
         print(
             f"[epoch {epoch:03d}] train={train_loss_value:.6f} val={val_text} "
             f"train_l1={train_loss['l1']:.5f} train_motion={train_loss['motion_ratio']:.3f} "
+            f"gt_motion={train_loss['gt_motion']:.5f} recon_motion={train_loss['recon_motion']:.5f} "
             f"| time={elapsed:.1f}s | lr={scheduler.get_last_lr()[0]:.2e}"
         )
         if val_metrics is not None:
@@ -699,6 +735,8 @@ if __name__ == "__main__":
     parser.add_argument("--amp", action="store_true", help="Enable Automatic Mixed Precision.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--mouth-roi", nargs=4, type=int, default=[45, 80, 32, 80], metavar=("Y1", "Y2", "X1", "X2"))
+    parser.add_argument("--input-mode", default="mouth_mask", choices=["full", "mouth_mask", "mouth_crop"], help="Visual input used for SSL pretraining.")
+    parser.add_argument("--mask-fill", type=float, default=0.0, help="Fill value outside mouth ROI when --input-mode=mouth_mask.")
     parser.add_argument("--mse-weight", type=float, default=0.25)
     parser.add_argument("--temporal-weight", type=float, default=10.0)
     parser.add_argument("--edge-weight", type=float, default=0.5)
