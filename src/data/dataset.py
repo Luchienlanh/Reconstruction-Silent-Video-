@@ -271,6 +271,7 @@ class VNLipDatasetV2(Dataset):
         enable_fallback: bool = True,
         force_full_frame: bool = False,
         lost_frame_threshold: float = 0.01,
+        use_offline_features: bool = False,
     ):
         self.data_dir = data_dir
         self.max_frames = max_frames
@@ -281,16 +282,8 @@ class VNLipDatasetV2(Dataset):
         self.enable_fallback = enable_fallback
         self.force_full_frame = force_full_frame
         self.lost_frame_threshold = lost_frame_threshold
+        self.use_offline_features = use_offline_features
         self.landmark_num_points = None
-
-        if not os.path.isdir(self.data_dir):
-            raise FileNotFoundError(f"Khong tim thay data_dir: {self.data_dir}")
-
-        self.files = sorted(f for f in os.listdir(self.data_dir) if f.endswith(".pt"))
-        if len(self.files) == 0:
-            raise RuntimeError(f"Khong co file .pt trong {self.data_dir}")
-
-        # Pre-scan first file for landmark shape
 
         if not os.path.isdir(self.data_dir):
             raise FileNotFoundError(f"Khong tim thay data_dir: {self.data_dir}")
