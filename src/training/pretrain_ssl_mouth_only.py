@@ -74,13 +74,14 @@ def collate_byol(batch):
     return torch.stack(batch, dim=0)
 
 
-# ========== Augmentations ==========
+# ========== Augmentations for mouth videos ==========
 class RandomBrightness(nn.Module):
     def __init__(self, strength=0.1):
         super().__init__()
         self.strength = strength
     def forward(self, x):
         if random.random() < 0.5:
+            # Add same brightness shift to the entire clip
             return x + torch.randn(1, device=x.device) * self.strength
         return x
 
@@ -93,6 +94,49 @@ class RandomContrast(nn.Module):
         if random.random() < 0.5:
             factor = random.uniform(self.min_factor, self.max_factor)
             return x * factor
+        return x
+
+class RandomHorizontalFlip(nn.Module):
+    def __init__(self, p=0.5):
+        super().__init__()
+        self.p = p
+    def forward(self, x):
+        # x: (B, C, T, H, W)
+        if random.random() < self.p:
+            return torch.flip(x, dims=[-1])  # Flip along W (horizontal) axis
+        return x
+
+class RandomShift(nn.Module):
+    def __init__(self, max_shift=4):
+        super().__init__()
+        self.max_shift = max_shift
+    def forward(self, x):
+        # x: (B, C, T, H, W)
+        if random.random() < 0.5:
+            B, C, T, H, W = x.shape
+            dx = random.randint(-self.max_shift, self.max_shift)
+            dy = random.randint(-self.max_shift, self.max_shift)
+            
+            # Pad and crop to translate
+            pad_left = max(0, dx)
+            pad_right = max(0, -dx)
+            pad_top = max(0, dy)
+            pad_bottom = max(0, -dy)
+            
+            padded = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom))
+            
+            start_x = pad_right
+            start_y = pad_bottom
+            return padded[:, :, :, start_y:start_y+H, start_x:start_x+W]
+        return x
+
+class RandomNoise(nn.Module):
+    def __init__(self, strength=0.015):
+        super().__init__()
+        self.strength = strength
+    def forward(self, x):
+        if random.random() < 0.5:
+            return x + torch.randn_like(x) * self.strength
         return x
 
 class RandomTimeMask(nn.Module):
@@ -110,8 +154,11 @@ class RandomTimeMask(nn.Module):
 
 def get_byol_augmentation():
     return nn.Sequential(
+        RandomHorizontalFlip(p=0.5),
+        RandomShift(max_shift=4),
         RandomBrightness(strength=0.05),
         RandomContrast(0.8, 1.2),
+        RandomNoise(strength=0.015),
         RandomTimeMask(max_mask_frames=4),
     )
 
