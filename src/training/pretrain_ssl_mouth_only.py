@@ -118,6 +118,115 @@ class MouthPatchDecoder(nn.Module):
         return self.temporal_refine(x)
 
 
+class FINERLayer(nn.Module):
+    def __init__(self, in_features: int, out_features: int, omega_zero: float = 30.0, is_first: bool = False):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.omega_zero = omega_zero
+        self.is_first = is_first
+        with torch.no_grad():
+            if is_first:
+                bound = 1.0 / in_features
+            else:
+                bound = float(torch.sqrt(torch.tensor(6.0 / in_features)) / omega_zero)
+            self.linear.weight.uniform_(-bound, bound)
+            nn.init.zeros_(self.linear.bias)
+
+    def forward(self, x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+        out_dtype = x.dtype
+        x = self.linear(x)
+        if not self.is_first:
+            x = self.omega_zero * x
+        modulated = gamma.float() * x.float() + beta.float()
+        phase = self.omega_zero * (torch.abs(modulated) + 1.0) * modulated
+        phase = torch.nan_to_num(phase, nan=0.0, posinf=1000.0, neginf=-1000.0).clamp(-1000.0, 1000.0)
+        return torch.sin(phase).to(dtype=out_dtype)
+
+
+class FINERMouthINRDecoder(nn.Module):
+    """
+    SSL-only coordinate decoder for mouth patches.
+    It learns a continuous image function f(z_t, x, y) -> pixel intensity.
+    """
+    def __init__(
+        self,
+        z_dim: int = 512,
+        out_channels: int = 1,
+        out_size: tuple[int, int] = (35, 48),
+        hidden_dim: int = 192,
+        num_layers: int = 4,
+        omega_zero: float = 30.0,
+        use_conv_params: bool = True,
+    ):
+        super().__init__()
+        self.out_size = out_size
+        self.out_channels = out_channels
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+
+        total_params = num_layers * 2 * hidden_dim
+        if use_conv_params:
+            self.param_net = nn.Conv1d(z_dim, total_params, kernel_size=3, padding=1)
+            nn.init.kaiming_uniform_(self.param_net.weight)
+            self.param_net.weight.data *= 0.01
+            nn.init.zeros_(self.param_net.bias)
+        else:
+            self.param_net = nn.Sequential(
+                nn.Linear(z_dim, z_dim),
+                nn.SiLU(inplace=True),
+                nn.Linear(z_dim, total_params),
+            )
+            nn.init.zeros_(self.param_net[-1].bias)
+
+        self.coord_in = nn.Linear(2, hidden_dim)
+        self.finer_layers = nn.ModuleList(
+            [
+                FINERLayer(hidden_dim, hidden_dim, omega_zero=omega_zero, is_first=(idx == 0))
+                for idx in range(num_layers)
+            ]
+        )
+        self.final_layer = nn.Linear(hidden_dim, out_channels)
+        nn.init.xavier_uniform_(self.final_layer.weight)
+        nn.init.zeros_(self.final_layer.bias)
+        self.output_bias = nn.Parameter(torch.zeros(1))
+
+    def _coords(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        h, w = self.out_size
+        y = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype)
+        x = torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        return torch.stack([xx, yy], dim=-1).reshape(h * w, 2)
+
+    def _conditioning(self, z: torch.Tensor) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        b, t, _ = z.shape
+        if isinstance(self.param_net, nn.Conv1d):
+            params = self.param_net(z.transpose(1, 2)).transpose(1, 2)
+        else:
+            params = self.param_net(z)
+        params = params.reshape(b * t, self.num_layers, 2, self.hidden_dim)
+        betas = [params[:, idx, 0] for idx in range(self.num_layers)]
+        gammas = [params[:, idx, 1] + 1.0 for idx in range(self.num_layers)]
+        return gammas, betas
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        b, t, _ = z.shape
+        h, w = self.out_size
+        num_pixels = h * w
+
+        coords = self._coords(z.device, z.dtype)
+        x = self.coord_in(coords).unsqueeze(0).expand(b * t, num_pixels, self.hidden_dim)
+        gammas, betas = self._conditioning(z)
+
+        for idx, layer in enumerate(self.finer_layers):
+            gamma = gammas[idx].unsqueeze(1)
+            beta = betas[idx].unsqueeze(1)
+            x = layer(x, gamma, beta)
+
+        out = self.final_layer(x).reshape(b, t, h, w, self.out_channels)
+        out = out.permute(0, 4, 1, 2, 3).contiguous()
+        return torch.sigmoid(out + self.output_bias)
+
+
 class SSLAutoencoder(nn.Module):
     """
     Wrapper module to combine the visual encoder and SSL-only mouth decoder.
@@ -155,6 +264,30 @@ def build_visual_encoder(encoder_type: str) -> nn.Module:
     from src.models.encoders.factory import build_encoder
     print(f"[visual-encoder] Instantiating full visual encoder: {encoder_type}")
     return build_encoder(encoder_type)
+
+
+def build_ssl_decoder(args: argparse.Namespace, out_size: tuple[int, int]) -> nn.Module:
+    decoder_type = args.ssl_decoder.lower()
+    if decoder_type == "conv":
+        print("[ssl-decoder] Using ConvTranspose mouth patch decoder")
+        return MouthPatchDecoder(
+            z_dim=512,
+            out_channels=1,
+            out_size=out_size,
+            base_channels=args.decoder_base_channels,
+        )
+    if decoder_type == "finer":
+        print("[ssl-decoder] Using FINER mouth INR decoder")
+        return FINERMouthINRDecoder(
+            z_dim=512,
+            out_channels=1,
+            out_size=out_size,
+            hidden_dim=args.finer_hidden_dim,
+            num_layers=args.finer_layers,
+            omega_zero=args.finer_omega,
+            use_conv_params=not args.no_finer_conv_params,
+        )
+    raise ValueError(f"Unknown ssl_decoder={args.ssl_decoder}")
 
 
 def parse_mouth_roi(values: list[int]) -> tuple[int, int, int, int]:
@@ -573,12 +706,7 @@ def main(args: argparse.Namespace) -> None:
 
     # 2. Build Models
     visual_encoder = build_visual_encoder(args.encoder_type).to(device)
-    decoder = MouthPatchDecoder(
-        z_dim=512,
-        out_channels=1,
-        out_size=(roi_h, roi_w),
-        base_channels=args.decoder_base_channels,
-    ).to(device)
+    decoder = build_ssl_decoder(args, out_size=(roi_h, roi_w)).to(device)
     model = SSLAutoencoder(visual_encoder, decoder).to(device)
 
     is_snn = args.encoder_type.lower() == "snn"
@@ -689,7 +817,7 @@ def main(args: argparse.Namespace) -> None:
             if hasattr(unwrapped_model.visual_encoder, "backbone"):
                 backbone_state = unwrapped_model.visual_encoder.backbone.state_dict()
             
-            checkpoint_name = f"pretrain_visual_encoder_{args.encoder_type.lower()}_ssl_mouth_patch.pth"
+            checkpoint_name = f"pretrain_visual_encoder_{args.encoder_type.lower()}_ssl_mouth_patch_{args.ssl_decoder.lower()}.pth"
             checkpoint_path = output_dir / checkpoint_name
             torch.save({
                 "epoch": epoch,
@@ -703,6 +831,7 @@ def main(args: argparse.Namespace) -> None:
                 "val_metrics": val_metrics,
                 "mouth_roi": mouth_roi,
                 "config": vars(args),
+                "ssl_decoder_type": args.ssl_decoder,
             }, checkpoint_path)
             print(f"  -> Best mouth-patch model checkpoint saved to: {safe_text(checkpoint_path)}")
 
@@ -740,7 +869,12 @@ if __name__ == "__main__":
     parser.add_argument("--mse-weight", type=float, default=0.25)
     parser.add_argument("--temporal-weight", type=float, default=10.0)
     parser.add_argument("--edge-weight", type=float, default=0.5)
+    parser.add_argument("--ssl-decoder", default="finer", choices=["finer", "conv"], help="SSL-only mouth patch decoder type.")
     parser.add_argument("--decoder-base-channels", type=int, default=192)
+    parser.add_argument("--finer-hidden-dim", type=int, default=192)
+    parser.add_argument("--finer-layers", type=int, default=4)
+    parser.add_argument("--finer-omega", type=float, default=30.0)
+    parser.add_argument("--no-finer-conv-params", action="store_true", help="Use per-frame MLP conditioning instead of temporal Conv1d conditioning for FINER.")
     parser.add_argument("--plot-train-every", type=int, default=1, help="When no val split exists, save a train reconstruction plot every N epochs.")
     parser.add_argument("--disable-fallback", default=True, action=argparse.BooleanOptionalAction, help="Disable dataset fallback replacement during aligned SSL pretrain.")
 
