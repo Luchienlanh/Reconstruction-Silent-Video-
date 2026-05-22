@@ -26,7 +26,13 @@ class MelTemporalUpsampleDecoder(nn.Module):
     def infer_target_len(self, video_len):
         return max(1, int(round(float(video_len) * self.ratio)))
 
-    def forward(self, condition, target_len=None):
+    def forward(self, condition=None, target_len=None):
+        # Handle empty sub-batches gracefully when using multi-GPU nn.DataParallel
+        if condition is None or (torch.is_tensor(condition) and condition.shape[0] == 0):
+            device = next(self.parameters()).device
+            t_len = target_len if target_len is not None else 0
+            return torch.empty(0, t_len, 80, device=device)
+
         if target_len is None:
             target_len = self.infer_target_len(condition.shape[1])
         if condition.shape[1] != target_len:
