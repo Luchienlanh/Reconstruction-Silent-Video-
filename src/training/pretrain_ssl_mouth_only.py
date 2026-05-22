@@ -118,7 +118,7 @@ def get_byol_augmentation():
     )
 
 
-# ========== BYOL components (using LayerNorm to support batch_size=1) ==========
+# ========== BYOL components (LayerNorm for batch_size=1) ==========
 class BYOLProjector(nn.Module):
     def __init__(self, in_dim=512, hidden_dim=4096, out_dim=256):
         super().__init__()
@@ -172,7 +172,6 @@ class BYOL(nn.Module):
                 param_online.requires_grad = True
 
     def forward(self, x1, x2):
-        # x1, x2: (B, 1, T, H, W)
         z1 = self.online_encoder(x1).mean(dim=1)   # (B, 512)
         z2 = self.online_encoder(x2).mean(dim=1)
         p1 = self.online_projector(z1)
@@ -195,13 +194,59 @@ class BYOL(nn.Module):
         self._update_target()
 
 
+# ========== Visualization helper ==========
+def save_mouth_samples(original, view1, view2, output_path, epoch, max_samples=4):
+    """
+    Save mouth ROI samples: original, view1 (aug1), view2 (aug2)
+    original, view1, view2: (B,1,T,H,W) tensors on CPU
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    B = min(original.shape[0], max_samples)
+    T = original.shape[2]
+    mid_frame = T // 2
+    fig, axes = plt.subplots(B, 3, figsize=(9, 3*B), constrained_layout=True)
+    if B == 1:
+        axes = axes.reshape(1, -1)
+    for i in range(B):
+        orig_img = original[i, 0, mid_frame].numpy()
+        v1_img = view1[i, 0, mid_frame].numpy()
+        v2_img = view2[i, 0, mid_frame].numpy()
+        axes[i,0].imshow(orig_img, cmap='gray', vmin=0, vmax=1)
+        axes[i,0].set_title(f"Sample {i} - Original")
+        axes[i,0].axis('off')
+        axes[i,1].imshow(v1_img, cmap='gray', vmin=0, vmax=1)
+        axes[i,1].set_title("View 1 (aug)")
+        axes[i,1].axis('off')
+        axes[i,2].imshow(v2_img, cmap='gray', vmin=0, vmax=1)
+        axes[i,2].set_title("View 2 (aug)")
+        axes[i,2].axis('off')
+    fig.suptitle(f"Epoch {epoch} - Mouth ROI samples (frame {mid_frame})", fontsize=12)
+    plt.savefig(output_path, dpi=100)
+    plt.close()
+
+
 # ========== Training loop ==========
 def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
-               checkpoint_dir=None, save_every=5, amp=False):
+               checkpoint_dir=None, save_every=5, save_images_every=5, amp=False):
     model.train()
     aug = get_byol_augmentation().to(device)
     scaler = torch.amp.GradScaler('cuda', enabled=amp and device.type=='cuda')
     best_loss = float('inf')
+
+    # Save initial samples (epoch 0)
+    if save_images_every > 0 and checkpoint_dir:
+        try:
+            sample_batch = next(iter(dataloader))
+            sample_batch = sample_batch.to(device)
+            with torch.no_grad():
+                v1 = aug(sample_batch)
+                v2 = aug(sample_batch)
+                save_mouth_samples(sample_batch.cpu(), v1.cpu(), v2.cpu(),
+                                   os.path.join(checkpoint_dir, "samples_epoch_0000.png"), 0)
+        except StopIteration:
+            pass
 
     for epoch in range(1, epochs+1):
         total_loss = 0.0
@@ -228,6 +273,7 @@ def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch:3d} | Loss: {avg_loss:.6f}")
 
+        # Save model checkpoint
         if checkpoint_dir and (epoch % save_every == 0 or epoch == epochs):
             os.makedirs(checkpoint_dir, exist_ok=True)
             ckpt = {
@@ -240,6 +286,20 @@ def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 torch.save(ckpt, os.path.join(checkpoint_dir, "byol_best.pth"))
+
+        # Save sample images
+        if save_images_every > 0 and checkpoint_dir and (epoch % save_images_every == 0 or epoch == epochs):
+            with torch.no_grad():
+                try:
+                    sample_batch = next(iter(dataloader))
+                    sample_batch = sample_batch.to(device)
+                    v1 = aug(sample_batch)
+                    v2 = aug(sample_batch)
+                    save_mouth_samples(sample_batch.cpu(), v1.cpu(), v2.cpu(),
+                                       os.path.join(checkpoint_dir, f"samples_epoch_{epoch:04d}.png"),
+                                       epoch)
+                except StopIteration:
+                    pass
 
     return model.online_encoder
 
@@ -266,6 +326,8 @@ def main():
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--save-images-every", type=int, default=5,
+                        help="Save mouth sample images every N epochs (0 to disable)")
     parser.add_argument("--mouth-roi", nargs=4, type=int, default=[45,80,32,80],
                         metavar=("Y1","Y2","X1","X2"))
     args = parser.parse_args()
@@ -349,6 +411,7 @@ def main():
         max_grad_norm=args.max_grad_norm,
         checkpoint_dir=args.output_dir,
         save_every=max(1, args.epochs//10),
+        save_images_every=args.save_images_every,
         amp=args.amp,
     )
 

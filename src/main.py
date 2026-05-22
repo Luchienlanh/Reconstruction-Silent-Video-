@@ -456,6 +456,16 @@ def run(args: argparse.Namespace) -> None:
             
             if not hasattr(encoder, "visual_encoder"):
                 print("[pretrained-ssl] WARNING: Could not locate visual_encoder in encoder!")
+            elif isinstance(checkpoint, dict) and "online_encoder_state_dict" in checkpoint:
+                missing_keys, unexpected_keys = encoder.visual_encoder.load_state_dict(
+                    checkpoint["online_encoder_state_dict"],
+                    strict=False,
+                )
+                print("[pretrained-ssl] Visual encoder loaded successfully from online_encoder_state_dict!")
+                if len(missing_keys) > 0:
+                    print(f"[pretrained-ssl] Missing keys (first 5): {missing_keys[:5]}")
+                if len(unexpected_keys) > 0:
+                    print(f"[pretrained-ssl] Unexpected keys (first 5): {unexpected_keys[:5]}")
             elif isinstance(checkpoint, dict) and "visual_encoder" in checkpoint:
                 missing_keys, unexpected_keys = encoder.visual_encoder.load_state_dict(
                     checkpoint["visual_encoder"],
