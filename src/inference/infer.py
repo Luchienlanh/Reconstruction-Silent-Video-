@@ -41,7 +41,7 @@ from models.decoders.siren import TFiLMSIRENDecoder  # noqa: E402
 from models.decoders.upsample import MelTemporalUpsampleDecoder  # noqa: E402
 from models.decoders.wire import TFiLMWIREDecoder  # noqa: E402
 from models.decoders.wrap import TFiLMWrapFISINDecoder, TFiLMWrapFIWIDecoder  # noqa: E402
-from models.encoders.factory import VisualLandmarkEncoderV2, build_encoder  # noqa: E402
+from models.encoders.factory import VisualLandmarkEncoder, VisualLandmarkEncoderV2, build_encoder  # noqa: E402
 
 DEFAULT_HIFIGAN_SOURCE = "speechbrain/tts-hifigan-libritts-16kHz"
 DEFAULT_HIFIGAN_SAVEDIR = PROJECT_ROOT / "pretrained_models" / "tts-hifigan-libritts-16kHz"
@@ -83,35 +83,43 @@ def config_value(args: argparse.Namespace, ckpt_config: dict, name: str, default
     return ckpt_config.get(name, default)
 
 
-def build_base_decoder(decoder_type: str):
+def build_base_decoder(decoder_type: str, target_type: str = "mel_hifigan"):
     decoder_type = decoder_type.lower()
     common = dict(hidden_dim=256, out_dim=80, num_layers=4, use_conv=True)
+    output_act = None if target_type == "mel_hifigan" else "tanh"
     if decoder_type == "siren":
         return TFiLMSIRENDecoder(**common, output_activation=None)
     if decoder_type == "wire":
-        return TFiLMWIREDecoder(**common)
+        return TFiLMWIREDecoder(**common, output_activation=output_act)
     if decoder_type == "finer":
-        return TFiLMFINERDecoder(**common)
+        return TFiLMFINERDecoder(**common, output_activation=output_act)
     if decoder_type == "dual":
-        return DualDecoder(**common)
+        return DualDecoder(**common, output_activation=output_act)
     if decoder_type in {"dual_wrap", "dualwrap"}:
-        return DualWrapDecoder(**common)
+        return DualWrapDecoder(**common, output_activation=output_act)
     if decoder_type in {"wrap_siren", "wrap_fisin", "wrap"}:
-        return TFiLMWrapFISINDecoder(**common)
+        return TFiLMWrapFISINDecoder(**common, output_activation=output_act)
     if decoder_type in {"wrap_wire", "wrap_fiwi"}:
-        return TFiLMWrapFIWIDecoder(**common)
+        return TFiLMWrapFIWIDecoder(**common, output_activation=output_act)
     raise ValueError(f"Unknown decoder_type: {decoder_type}")
 
 
-def build_models(device: torch.device, encoder_type: str, decoder_type: str, num_landmark_points: int):
+def build_models(device: torch.device, encoder_type: str, decoder_type: str, num_landmark_points: int, fusion_type: str = "cross_attn", target_type: str = "mel_hifigan"):
     visual_encoder = build_encoder(encoder_type).to(device)
-    encoder = VisualLandmarkEncoderV2(
-        visual_encoder,
-        num_landmark_points=num_landmark_points,
-        z_dim=512,
-    ).to(device)
+    if fusion_type == "concat":
+        encoder = VisualLandmarkEncoder(
+            visual_encoder,
+            num_landmark_points=num_landmark_points,
+            z_dim=512,
+        ).to(device)
+    else:
+        encoder = VisualLandmarkEncoderV2(
+            visual_encoder,
+            num_landmark_points=num_landmark_points,
+            z_dim=512,
+        ).to(device)
 
-    base_decoder = build_base_decoder(decoder_type).to(device)
+    base_decoder = build_base_decoder(decoder_type, target_type=target_type).to(device)
     decoder = MelTemporalUpsampleDecoder(
         base_decoder,
         sample_rate=16000,
@@ -255,6 +263,8 @@ def infer_one(
     index: int,
     device: torch.device,
     encoder_type: str,
+    crop_mouth: bool = False,
+    mouth_roi: list[int] | None = None,
 ):
     batch = collate_pad_v2([dataset[index]])
     video, landmarks, target, lengths, paths = batch
@@ -262,6 +272,12 @@ def infer_one(
     landmarks = landmarks.to(device)
     target = target.to(device)
     lengths = lengths.to(device)
+
+    # Crop mouth region if specified (must match training)
+    if crop_mouth and video.dim() == 5:
+        roi = mouth_roi or [45, 80, 32, 80]
+        y1, y2, x1, x2 = roi
+        video = video[:, :, :, y1:y2, x1:x2]
 
     encoder.eval()
     decoder.eval()
@@ -379,7 +395,8 @@ def run(args: argparse.Namespace) -> None:
     dataset, data_dir, max_frames = create_dataset(args, ckpt_config)
     encoder_type = args.encoder_type or ckpt_config.get("encoder_type", "non_snn")
     decoder_type = args.decoder_type or ckpt_config.get("decoder_type", "siren")
-    encoder, decoder = build_models(device, encoder_type, decoder_type, dataset.landmark_num_points)
+    fusion_type = args.fusion_type or ckpt_config.get("fusion_type", "cross_attn")
+    encoder, decoder = build_models(device, encoder_type, decoder_type, dataset.landmark_num_points, fusion_type=fusion_type)
 
     # Checkpoint weight loading (compatible mode by default)
     if args.strict:
@@ -419,7 +436,9 @@ def run(args: argparse.Namespace) -> None:
         if index < 0 or index >= len(dataset):
             raise IndexError(f"--index {index} out of range for dataset size {len(dataset)}")
 
-        result = infer_one(encoder, decoder, dataset, index, device, encoder_type)
+        crop_mouth = getattr(args, "crop_mouth", False)
+        mouth_roi = getattr(args, "mouth_roi", [45, 80, 32, 80])
+        result = infer_one(encoder, decoder, dataset, index, device, encoder_type, crop_mouth=crop_mouth, mouth_roi=mouth_roi)
         sample_name = Path(result["path"]).name
         plot_path = output_dir / f"pred_vs_gt_index_{index:05d}.png"
         title = f"index={index} | L1={result['l1']:.6f} | {sample_name}"
@@ -514,6 +533,9 @@ def parse_args() -> argparse.Namespace:
         choices=["siren", "wire", "finer", "dual", "dual_wrap", "wrap_siren", "wrap_fisin", "wrap", "wrap_wire", "wrap_fiwi"],
     )
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--fusion-type", default=None, choices=["concat", "cross_attn"], help="Must match training config.")
+    parser.add_argument("--crop-mouth", action="store_true", help="Crop mouth region from video frames (must match training).")
+    parser.add_argument("--mouth-roi", type=int, nargs=4, default=[45, 80, 32, 80], metavar=("Y1", "Y2", "X1", "X2"), help="Mouth ROI [y1 y2 x1 x2].")
     parser.add_argument("--force-full-frame", default=None, action=argparse.BooleanOptionalAction)
     parser.add_argument("--disable-fallback", default=None, action=argparse.BooleanOptionalAction)
     parser.add_argument("--save-pt", action="store_true", help="Save predicted mel tensors as .pt files.")
