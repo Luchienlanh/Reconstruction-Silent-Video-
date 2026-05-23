@@ -84,12 +84,18 @@ def config_value(args: argparse.Namespace, ckpt_config: dict, name: str, default
     return ckpt_config.get(name, default)
 
 
-def build_base_decoder(decoder_type: str, target_type: str = "mel_hifigan"):
+def build_base_decoder(
+    decoder_type: str,
+    target_type: str = "mel_hifigan",
+    hidden_dim: int = 256,
+    num_layers: int = 4,
+    dropout: float = 0.0,
+):
     decoder_type = decoder_type.lower()
-    common = dict(hidden_dim=256, out_dim=80, num_layers=4, use_conv=True)
+    common = dict(hidden_dim=hidden_dim, out_dim=80, num_layers=num_layers, use_conv=True)
     output_act = None if target_type == "mel_hifigan" else "tanh"
     if decoder_type == "direct_tcn":
-        return DirectTCNMelDecoder(hidden_dim=512, out_dim=80, num_layers=6)
+        return DirectTCNMelDecoder(hidden_dim=hidden_dim, out_dim=80, num_layers=num_layers, dropout=dropout)
     if decoder_type == "siren":
         return TFiLMSIRENDecoder(**common, output_activation=None)
     if decoder_type == "wire":
@@ -107,7 +113,17 @@ def build_base_decoder(decoder_type: str, target_type: str = "mel_hifigan"):
     raise ValueError(f"Unknown decoder_type: {decoder_type}")
 
 
-def build_models(device: torch.device, encoder_type: str, decoder_type: str, num_landmark_points: int, fusion_type: str = "cross_attn", target_type: str = "mel_hifigan"):
+def build_models(
+    device: torch.device,
+    encoder_type: str,
+    decoder_type: str,
+    num_landmark_points: int,
+    fusion_type: str = "cross_attn",
+    target_type: str = "mel_hifigan",
+    decoder_hidden_dim: int = 256,
+    decoder_num_layers: int = 4,
+    decoder_dropout: float = 0.0,
+):
     visual_encoder = build_encoder(encoder_type).to(device)
     if fusion_type == "concat":
         encoder = VisualLandmarkEncoder(
@@ -128,7 +144,13 @@ def build_models(device: torch.device, encoder_type: str, decoder_type: str, num
             z_dim=512,
         ).to(device)
 
-    base_decoder = build_base_decoder(decoder_type, target_type=target_type).to(device)
+    base_decoder = build_base_decoder(
+        decoder_type,
+        target_type=target_type,
+        hidden_dim=decoder_hidden_dim,
+        num_layers=decoder_num_layers,
+        dropout=decoder_dropout,
+    ).to(device)
     decoder = MelTemporalUpsampleDecoder(
         base_decoder,
         sample_rate=16000,
@@ -315,6 +337,9 @@ def run_smoke_test(args: argparse.Namespace, device: torch.device) -> None:
         encoder_type=args.encoder_type or "non_snn",
         decoder_type=args.decoder_type or "siren",
         num_landmark_points=args.num_landmark_points,
+        decoder_hidden_dim=args.decoder_hidden_dim or 256,
+        decoder_num_layers=args.decoder_num_layers or 4,
+        decoder_dropout=args.decoder_dropout or 0.0,
     )
     encoder.eval()
     decoder.eval()
@@ -405,7 +430,21 @@ def run(args: argparse.Namespace) -> None:
     encoder_type = args.encoder_type or ckpt_config.get("encoder_type", "non_snn")
     decoder_type = args.decoder_type or ckpt_config.get("decoder_type", "siren")
     fusion_type = args.fusion_type or ckpt_config.get("fusion_type", "cross_attn")
-    encoder, decoder = build_models(device, encoder_type, decoder_type, dataset.landmark_num_points, fusion_type=fusion_type)
+    default_decoder_hidden = 512 if decoder_type == "direct_tcn" else 256
+    default_decoder_layers = 6 if decoder_type == "direct_tcn" else 4
+    decoder_hidden_dim = config_value(args, ckpt_config, "decoder_hidden_dim", default_decoder_hidden)
+    decoder_num_layers = config_value(args, ckpt_config, "decoder_num_layers", default_decoder_layers)
+    decoder_dropout = config_value(args, ckpt_config, "decoder_dropout", 0.0)
+    encoder, decoder = build_models(
+        device,
+        encoder_type,
+        decoder_type,
+        dataset.landmark_num_points,
+        fusion_type=fusion_type,
+        decoder_hidden_dim=decoder_hidden_dim,
+        decoder_num_layers=decoder_num_layers,
+        decoder_dropout=decoder_dropout,
+    )
 
     # Checkpoint weight loading (compatible mode by default)
     if args.strict:
@@ -428,7 +467,10 @@ def run(args: argparse.Namespace) -> None:
     print(f"[device] {device}")
     print(f"[checkpoint] {safe_text(checkpoint_path)}")
     print(f"[data] {safe_text(data_dir)}")
-    print(f"[model] encoder={encoder_type} decoder={decoder_type} landmarks={dataset.landmark_num_points} max_frames={max_frames}")
+    print(
+        f"[model] encoder={encoder_type} decoder={decoder_type} hidden={decoder_hidden_dim} "
+        f"layers={decoder_num_layers} landmarks={dataset.landmark_num_points} max_frames={max_frames}"
+    )
 
     start = 0 if args.sample else args.index
     indices = [start] if args.sample else list(range(start, min(start + args.num_samples, len(dataset))))
@@ -541,6 +583,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=["siren", "direct_tcn", "wire", "finer", "dual", "dual_wrap", "wrap_siren", "wrap_fisin", "wrap", "wrap_wire", "wrap_fiwi"],
     )
+    parser.add_argument("--decoder-hidden-dim", type=int, default=None)
+    parser.add_argument("--decoder-num-layers", type=int, default=None)
+    parser.add_argument("--decoder-dropout", type=float, default=None)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--fusion-type", default=None, choices=["concat", "cross_attn", "gated_residual"], help="Must match training config.")
     parser.add_argument("--crop-mouth", action="store_true", help="Crop mouth region from video frames (must match training).")

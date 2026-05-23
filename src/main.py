@@ -132,12 +132,18 @@ def set_module_trainable(module: Optional[torch.nn.Module], trainable: bool) -> 
         param.requires_grad = trainable
 
 
-def build_base_decoder(decoder_type: str, target_type: str = "mel_hifigan"):
+def build_base_decoder(
+    decoder_type: str,
+    target_type: str = "mel_hifigan",
+    hidden_dim: int = 256,
+    num_layers: int = 4,
+    dropout: float = 0.0,
+):
     decoder_type = decoder_type.lower()
-    common = dict(hidden_dim=256, out_dim=80, num_layers=4, use_conv=True)
+    common = dict(hidden_dim=hidden_dim, out_dim=80, num_layers=num_layers, use_conv=True)
     output_act = None if target_type == "mel_hifigan" else "tanh"
     if decoder_type == "direct_tcn":
-        return DirectTCNMelDecoder(hidden_dim=512, out_dim=80, num_layers=6)
+        return DirectTCNMelDecoder(hidden_dim=hidden_dim, out_dim=80, num_layers=num_layers, dropout=dropout)
     if decoder_type == "siren":
         return TFiLMSIRENDecoder(**common, output_activation=None)
     if decoder_type == "wire":
@@ -155,7 +161,17 @@ def build_base_decoder(decoder_type: str, target_type: str = "mel_hifigan"):
     raise ValueError(f"Unknown decoder_type: {decoder_type}")
 
 
-def build_models(device: torch.device, encoder_type: str, decoder_type: str, num_landmark_points: int, fusion_type: str = "cross_attn", target_type: str = "mel_hifigan"):
+def build_models(
+    device: torch.device,
+    encoder_type: str,
+    decoder_type: str,
+    num_landmark_points: int,
+    fusion_type: str = "cross_attn",
+    target_type: str = "mel_hifigan",
+    decoder_hidden_dim: int = 256,
+    decoder_num_layers: int = 4,
+    decoder_dropout: float = 0.0,
+):
     visual_encoder = build_encoder(encoder_type).to(device)
     if fusion_type == "concat":
         encoder = VisualLandmarkEncoder(
@@ -176,7 +192,13 @@ def build_models(device: torch.device, encoder_type: str, decoder_type: str, num
             z_dim=512,
         ).to(device)
 
-    base_decoder = build_base_decoder(decoder_type, target_type=target_type).to(device)
+    base_decoder = build_base_decoder(
+        decoder_type,
+        target_type=target_type,
+        hidden_dim=decoder_hidden_dim,
+        num_layers=decoder_num_layers,
+        dropout=decoder_dropout,
+    ).to(device)
     decoder = MelTemporalUpsampleDecoder(
         base_decoder,
         sample_rate=16000,
@@ -203,7 +225,7 @@ def load_compatible_state_dict(module: torch.nn.Module, state_dict: dict, tag: s
         compatible[clean_key] = value
 
     missing_keys, unexpected_keys = module.load_state_dict(compatible, strict=False)
-    prefix = "[pretrained-decoder]" if "decoder" in tag else "[pretrained-ssl]"
+    prefix = "[pretrained-ssl]"
     print(
         f"{prefix} {tag}: loaded={len(compatible)} "
         f"missing={len(missing_keys)} unexpected={len(unexpected) + len(unexpected_keys)} skipped_shape={len(skipped)}"
@@ -217,25 +239,6 @@ def load_compatible_state_dict(module: torch.nn.Module, state_dict: dict, tag: s
         formatted = [f"{k}: ckpt{src}->model{dst}" for k, src, dst in skipped[:8]]
         print(f"{prefix} {tag} skipped shape mismatch (first 8): {formatted}")
     return missing_keys, combined_unexpected, skipped
-
-
-def load_pretrained_decoder(decoder: torch.nn.Module, checkpoint_path: Path, device: torch.device) -> None:
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = checkpoint.get("decoder_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-    if not isinstance(state_dict, dict):
-        raise ValueError(f"Unsupported decoder checkpoint format: {safe_text(checkpoint_path)}")
-
-    dec_module = unwrap_module(decoder)
-    target_state = dec_module.state_dict()
-    clean_state = {key.removeprefix("module."): value for key, value in state_dict.items()}
-
-    if not any(key in target_state for key in clean_state):
-        prefixed = {f"base_decoder.{key}": value for key, value in clean_state.items()}
-        if any(key in target_state for key in prefixed):
-            clean_state = prefixed
-
-    load_compatible_state_dict(dec_module, clean_state, f"decoder from {safe_text(checkpoint_path)}")
-
 
 def make_criterion(args: argparse.Namespace, device: torch.device):
     return MelReconstructionLoss(
@@ -413,8 +416,6 @@ def train_one_epoch(
         visual_encoder = get_visual_encoder_module(encoder)
         if visual_encoder is not None:
             visual_encoder.eval()
-    if getattr(args, "freeze_decoder_active", False):
-        decoder.eval()
     amp_enabled = device.type == "cuda" and args.amp
     total_loss = 0.0
     num_batches = 0
@@ -585,6 +586,9 @@ def run(args: argparse.Namespace) -> None:
         dataset.landmark_num_points,
         fusion_type=getattr(args, "fusion_type", "cross_attn"),
         target_type="mel_hifigan",
+        decoder_hidden_dim=args.decoder_hidden_dim,
+        decoder_num_layers=args.decoder_num_layers,
+        decoder_dropout=args.decoder_dropout,
     )
     
     # Load Pre-trained SSL Weights if specified
@@ -625,14 +629,6 @@ def run(args: argparse.Namespace) -> None:
         else:
             print(f"[pretrained-ssl] WARNING: Pretrained SSL path {args.pretrained_ssl} does not exist or is not a file!")
 
-    if getattr(args, "pretrained_decoder", None) is not None:
-        pretrained_decoder_path = resolve_path(args.pretrained_decoder)
-        if pretrained_decoder_path and pretrained_decoder_path.is_file():
-            print(f"[pretrained-decoder] Loading weights from {safe_text(pretrained_decoder_path)}")
-            load_pretrained_decoder(decoder, pretrained_decoder_path, device)
-        else:
-            print(f"[pretrained-decoder] WARNING: path {args.pretrained_decoder} does not exist or is not a file!")
-
     criterion = make_criterion(args, device)
 
     if args.visual_lr_scale is None:
@@ -643,8 +639,6 @@ def run(args: argparse.Namespace) -> None:
         args.decoder_lr_scale = 5.0 if args.decoder_type.lower() == "direct_tcn" else (4.0 if args.decoder_type.lower() == "siren" else 1.0)
     if args.freeze_visual_epochs is None:
         args.freeze_visual_epochs = 2 if args.pretrained_ssl else 0
-    if args.freeze_decoder_epochs is None:
-        args.freeze_decoder_epochs = 5 if args.pretrained_decoder else 0
 
     # Wrap model in nn.DataParallel to utilize all available GPUs
     if device.type == "cuda" and torch.cuda.device_count() > 1:
@@ -702,13 +696,15 @@ def run(args: argparse.Namespace) -> None:
         print(f"[device] Multi-GPU Active: {torch.cuda.device_count()}x GPUs utilized.")
     print(f"[data] {safe_text(resolve_path(args.data_dir))}")
     print(f"[split] train={train_count} val={val_count}")
-    print(f"[model] encoder={args.encoder_type} decoder={args.decoder_type} landmarks={dataset.landmark_num_points}")
+    print(
+        f"[model] encoder={args.encoder_type} decoder={args.decoder_type} "
+        f"hidden={args.decoder_hidden_dim} layers={args.decoder_num_layers} "
+        f"landmarks={dataset.landmark_num_points}"
+    )
     lr_summary = ", ".join(f"{group.get('name', idx)}={group['lr']:.2e}" for idx, group in enumerate(optimizer_groups))
     print(f"[lr] {lr_summary}")
     if args.freeze_visual_epochs > 0:
         print(f"[freeze] visual_encoder frozen for first {args.freeze_visual_epochs} epoch(s)")
-    if args.freeze_decoder_epochs > 0:
-        print(f"[freeze] decoder frozen for first {args.freeze_decoder_epochs} epoch(s)")
     print(
         "[loss] mel=1.0 delta={} delta2={} energy={}".format(
             args.lambda_delta,
@@ -725,17 +721,10 @@ def run(args: argparse.Namespace) -> None:
         freeze_visual = epoch <= args.freeze_visual_epochs
         args.freeze_visual_active = freeze_visual
         set_module_trainable(get_visual_encoder_module(encoder), not freeze_visual)
-        freeze_decoder = epoch <= args.freeze_decoder_epochs
-        args.freeze_decoder_active = freeze_decoder
-        set_module_trainable(unwrap_module(decoder), not freeze_decoder)
         if epoch == 1 and freeze_visual:
             print("[freeze] visual_encoder frozen; training fusion/decoder against BYOL features first")
         elif epoch == args.freeze_visual_epochs + 1 and args.freeze_visual_epochs > 0:
             print("[freeze] visual_encoder unfrozen")
-        if epoch == 1 and freeze_decoder:
-            print("[freeze] decoder frozen; training encoder/fusion into pretrained decoder space")
-        elif epoch == args.freeze_decoder_epochs + 1 and args.freeze_decoder_epochs > 0:
-            print("[freeze] decoder unfrozen")
 
         if args.curriculum:
             current_frames = get_curriculum_frames(epoch, args.epochs, target_max_frames)
@@ -856,6 +845,9 @@ def parse_args() -> argparse.Namespace:
         default="siren",
         choices=["siren", "direct_tcn", "wire", "finer", "dual", "dual_wrap", "wrap_siren", "wrap_fisin", "wrap", "wrap_wire", "wrap_fiwi"],
     )
+    parser.add_argument("--decoder-hidden-dim", type=int, default=256, help="Hidden dimension for the decoder.")
+    parser.add_argument("--decoder-num-layers", type=int, default=4, help="Number of decoder layers/blocks.")
+    parser.add_argument("--decoder-dropout", type=float, default=0.0, help="Dropout for decoders that support it.")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -885,12 +877,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Number of warmup epochs for cosine scheduler.")
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning (progressive max_frames).")
     parser.add_argument("--pretrained-ssl", default=None, help="Path to self-supervised pre-trained backbone checkpoint.")
-    parser.add_argument("--pretrained-decoder", default=None, help="Path to decoder checkpoint, e.g. best_decoder_latent.pth from capacity test.")
     parser.add_argument("--visual-lr-scale", type=float, default=None, help="Scale base LR for the visual encoder. Default: 0.25 with SSL, else 1.0.")
     parser.add_argument("--fusion-lr-scale", type=float, default=None, help="Scale base LR for landmark/fusion layers. Default: 1.0.")
     parser.add_argument("--decoder-lr-scale", type=float, default=None, help="Scale base LR for decoder. Default: 5.0 for direct_tcn, 4.0 for siren, else 1.0.")
     parser.add_argument("--freeze-visual-epochs", type=int, default=None, help="Freeze visual encoder for the first N epochs. Default: 2 with SSL, else 0.")
-    parser.add_argument("--freeze-decoder-epochs", type=int, default=None, help="Freeze decoder for the first N epochs. Default: 5 with --pretrained-decoder, else 0.")
     return parser.parse_args()
 
 
