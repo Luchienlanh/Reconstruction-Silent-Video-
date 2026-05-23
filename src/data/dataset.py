@@ -290,9 +290,12 @@ class VNLipDatasetV2(Dataset):
         self.use_optical_flow = use_optical_flow
         self.flow_method = flow_method
         self.flow_scale = max(float(flow_scale), 1e-6)
+        if isinstance(flow_cache_dir, str) and flow_cache_dir.strip().lower() in {"", "none", "null", "off", "false"}:
+            flow_cache_dir = None
         self.flow_cache_dir = flow_cache_dir
         self.landmark_num_points = None
         self._flow_warned = False
+        self._flow_cache_warned = False
 
         if not os.path.isdir(self.data_dir):
             raise FileNotFoundError(f"Khong tim thay data_dir: {self.data_dir}")
@@ -472,20 +475,39 @@ class VNLipDatasetV2(Dataset):
     def _load_or_compute_flow(self, video: torch.Tensor, file_name: str) -> torch.Tensor:
         cache_path = self._flow_cache_path(file_name)
         if cache_path and os.path.isfile(cache_path):
-            cached = torch.load(cache_path, map_location="cpu", weights_only=False)
-            if isinstance(cached, dict):
-                cached = cached.get("flow", cached.get("optical_flow"))
-            if torch.is_tensor(cached) and cached.dim() == 4 and cached.shape[0] == 2:
-                if (
-                    cached.shape[1] == video.shape[1]
-                    and cached.shape[2] == video.shape[2]
-                    and cached.shape[3] == video.shape[3]
-                ):
-                    return cached.float()
+            try:
+                cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+                if isinstance(cached, dict):
+                    cached = cached.get("flow", cached.get("optical_flow"))
+                if torch.is_tensor(cached) and cached.dim() == 4 and cached.shape[0] == 2:
+                    if (
+                        cached.shape[1] == video.shape[1]
+                        and cached.shape[2] == video.shape[2]
+                        and cached.shape[3] == video.shape[3]
+                    ):
+                        return cached.float()
+            except Exception:
+                try:
+                    os.remove(cache_path)
+                except OSError:
+                    pass
 
         flow = self._compute_optical_flow(video).float()
         if cache_path:
-            torch.save({"flow": flow}, cache_path)
+            try:
+                torch.save({"flow": flow.half()}, cache_path)
+            except Exception as exc:
+                if not self._flow_cache_warned:
+                    warnings.warn(
+                        f"Could not write optical-flow cache ({exc}). Continuing without cache. "
+                        "Use --flow-cache-dir none on low-disk systems."
+                    )
+                    self._flow_cache_warned = True
+                try:
+                    if os.path.isfile(cache_path):
+                        os.remove(cache_path)
+                except OSError:
+                    pass
         return flow
 
     def _crop(self, video, target, target_len, landmarks=None, data=None, flow=None):

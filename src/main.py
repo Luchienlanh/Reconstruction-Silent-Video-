@@ -66,6 +66,14 @@ def resolve_path(path: Optional[str]) -> Optional[Path]:
     return p
 
 
+def resolve_optional_cache_dir(path: Optional[str]) -> Optional[Path]:
+    if path is None:
+        return None
+    if str(path).strip().lower() in {"", "none", "null", "off", "false"}:
+        return None
+    return resolve_path(path)
+
+
 def default_data_dir() -> str:
     full_frame = PROJECT_ROOT / "FullFrame_test"
     if full_frame.is_dir():
@@ -545,7 +553,7 @@ def evaluate_mean_baseline(
 def create_loaders(args: argparse.Namespace):
     data_dir = resolve_path(args.data_dir)
     dataset_output_dir = resolve_path(args.dataset_output_dir)
-    flow_cache_dir = resolve_path(args.flow_cache_dir) if getattr(args, "flow_cache_dir", None) else None
+    flow_cache_dir = resolve_optional_cache_dir(getattr(args, "flow_cache_dir", None))
     use_optical_flow = bool(getattr(args, "use_optical_flow", False) or is_flow_encoder_type(args.encoder_type))
     if data_dir is None or not data_dir.is_dir():
         raise FileNotFoundError(f"Data dir not found: {safe_text(data_dir)}")
@@ -655,6 +663,16 @@ def _target_from_dataset_item(item) -> torch.Tensor:
     raise ValueError("Dataset item does not contain a target tensor.")
 
 
+def _target_from_dataset_index(dataset, idx: int) -> torch.Tensor:
+    if hasattr(dataset, "data_dir") and hasattr(dataset, "files") and hasattr(dataset, "_get_target"):
+        file_name = dataset.files[idx]
+        file_path = file_name if os.path.isabs(str(file_name)) else os.path.join(dataset.data_dir, file_name)
+        data = torch.load(file_path, map_location="cpu", weights_only=False)
+        target, _ = dataset._get_target(data, file_path)
+        return target
+    return _target_from_dataset_item(dataset[idx])
+
+
 def compute_mel_stats(dataset, max_samples: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
     limit = len(dataset) if max_samples <= 0 else min(len(dataset), int(max_samples))
     if limit <= 0:
@@ -664,7 +682,7 @@ def compute_mel_stats(dataset, max_samples: int = 0) -> tuple[torch.Tensor, torc
     total_sq = None
     count = 0
     for idx in tqdm(range(limit), desc="mel-stats", leave=False):
-        target = _target_from_dataset_item(dataset[idx]).float()
+        target = _target_from_dataset_index(dataset, idx).float()
         if target.dim() != 2:
             raise ValueError(f"Expected mel target (T,80), got {tuple(target.shape)}")
         total = target.sum(dim=0) if total is None else total + target.sum(dim=0)
@@ -802,8 +820,9 @@ def run(args: argparse.Namespace) -> None:
             )
         )
     if getattr(args, "use_optical_flow", False) or is_flow_encoder_type(args.encoder_type):
+        flow_cache_dir = resolve_optional_cache_dir(args.flow_cache_dir)
         print(
-            f"[flow] enabled method={args.flow_method} cache={safe_text(resolve_path(args.flow_cache_dir)) if args.flow_cache_dir else 'none'}"
+            f"[flow] enabled method={args.flow_method} cache={safe_text(flow_cache_dir) if flow_cache_dir else 'none'}"
         )
     print(
         f"[model] encoder={args.encoder_type} decoder={args.decoder_type} "
