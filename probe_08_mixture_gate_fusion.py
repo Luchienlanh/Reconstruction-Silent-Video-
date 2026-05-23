@@ -42,7 +42,7 @@ class MixtureGateFusion(nn.Module):
         gate = torch.softmax(self.gate(torch.cat([zl, zv], dim=-1)), dim=-1)
         self.last_gate = gate.detach()
         z = gate[..., 0:1] * zl + gate[..., 1:2] * zv + gate[..., 2:3] * zj
-        return {"pred": self.decoder(z, target_len=target_len), "z": z}
+        return {"pred": self.decoder(z, target_len=target_len), "z": z, "gate": gate}
 
 
 def run(args: argparse.Namespace) -> None:

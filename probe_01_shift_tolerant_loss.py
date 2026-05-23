@@ -75,6 +75,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--decoder-num-layers", type=int, default=6)
     parser.add_argument("--decoder-dropout", type=float, default=0.0)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--multi-gpu", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--val-batch-size", type=int, default=None)
@@ -103,6 +104,22 @@ def device_from_args(args: argparse.Namespace) -> torch.device:
     if args.device == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(args.device)
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def maybe_wrap_model(model: nn.Module, args: argparse.Namespace, device: torch.device) -> nn.Module:
+    if (
+        device.type == "cuda"
+        and getattr(args, "multi_gpu", True)
+        and torch.cuda.device_count() > 1
+        and not isinstance(model, nn.DataParallel)
+    ):
+        print(f"[device] Found {torch.cuda.device_count()} GPUs. Using nn.DataParallel.")
+        return nn.DataParallel(model)
+    return model
 
 
 def make_dataset(args: argparse.Namespace, files: list[str], random_crop: bool) -> VNLipDatasetV2:
@@ -289,6 +306,7 @@ def train_probe(
     after_epoch: Optional[Callable] = None,
     mel_mean: Optional[torch.Tensor] = None,
 ) -> list[dict]:
+    model = maybe_wrap_model(model, args, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and args.amp)
     amp_enabled = device.type == "cuda" and args.amp
@@ -301,10 +319,11 @@ def train_probe(
         model.train()
         train_total = 0.0
         train_count = 0
+        last_out = None
         for batch in tqdm(train_loader, desc=f"train {epoch:04d}", leave=False):
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=amp_enabled):
-                loss, _ = loss_fn(model, batch, criterion, device, args)
+                loss, out = loss_fn(model, batch, criterion, device, args)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite train loss: {float(loss.detach().cpu())}")
             scaler.scale(loss).backward()
@@ -313,8 +332,13 @@ def train_probe(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
+            last_out = out
             train_total += float(loss.detach().cpu())
             train_count += 1
+
+        base_model = unwrap_model(model)
+        if isinstance(last_out, dict) and "gate" in last_out and hasattr(base_model, "last_gate"):
+            base_model.last_gate = last_out["gate"].detach()
 
         val_loss = None
         if val_loader is not None:
@@ -328,7 +352,7 @@ def train_probe(
                     val_count += 1
             val_loss = val_total / max(1, val_count)
 
-        extra = after_epoch(model, epoch) if after_epoch is not None else {}
+        extra = after_epoch(unwrap_model(model), epoch) if after_epoch is not None else {}
         row = {
             "epoch": epoch,
             "train": train_total / max(1, train_count),

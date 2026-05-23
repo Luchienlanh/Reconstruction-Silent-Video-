@@ -16,6 +16,7 @@ from probe_01_shift_tolerant_loss import (
     init_decoder_bias,
     make_criterion,
     make_dataset,
+    maybe_wrap_model,
     resolve_path,
     safe_text,
     save_history,
@@ -80,6 +81,7 @@ def run(args: argparse.Namespace) -> None:
     ).to(device)
     init_decoder_bias(decoder, mel_mean)
     model = SampleIdLatentModel(len(train_base), args.latent_len, decoder).to(device)
+    model = maybe_wrap_model(model, args, device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     print(f"[probe] sample_id_embedding train_files={len(train_base)} latent_len={args.latent_len}")
     history = []
