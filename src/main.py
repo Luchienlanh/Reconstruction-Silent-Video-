@@ -203,19 +203,38 @@ def load_compatible_state_dict(module: torch.nn.Module, state_dict: dict, tag: s
         compatible[clean_key] = value
 
     missing_keys, unexpected_keys = module.load_state_dict(compatible, strict=False)
+    prefix = "[pretrained-decoder]" if "decoder" in tag else "[pretrained-ssl]"
     print(
-        f"[pretrained-ssl] {tag}: loaded={len(compatible)} "
+        f"{prefix} {tag}: loaded={len(compatible)} "
         f"missing={len(missing_keys)} unexpected={len(unexpected) + len(unexpected_keys)} skipped_shape={len(skipped)}"
     )
     if missing_keys:
-        print(f"[pretrained-ssl] {tag} missing (first 8): {missing_keys[:8]}")
+        print(f"{prefix} {tag} missing (first 8): {missing_keys[:8]}")
     combined_unexpected = unexpected + list(unexpected_keys)
     if combined_unexpected:
-        print(f"[pretrained-ssl] {tag} unexpected (first 8): {combined_unexpected[:8]}")
+        print(f"{prefix} {tag} unexpected (first 8): {combined_unexpected[:8]}")
     if skipped:
         formatted = [f"{k}: ckpt{src}->model{dst}" for k, src, dst in skipped[:8]]
-        print(f"[pretrained-ssl] {tag} skipped shape mismatch (first 8): {formatted}")
+        print(f"{prefix} {tag} skipped shape mismatch (first 8): {formatted}")
     return missing_keys, combined_unexpected, skipped
+
+
+def load_pretrained_decoder(decoder: torch.nn.Module, checkpoint_path: Path, device: torch.device) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = checkpoint.get("decoder_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"Unsupported decoder checkpoint format: {safe_text(checkpoint_path)}")
+
+    dec_module = unwrap_module(decoder)
+    target_state = dec_module.state_dict()
+    clean_state = {key.removeprefix("module."): value for key, value in state_dict.items()}
+
+    if not any(key in target_state for key in clean_state):
+        prefixed = {f"base_decoder.{key}": value for key, value in clean_state.items()}
+        if any(key in target_state for key in prefixed):
+            clean_state = prefixed
+
+    load_compatible_state_dict(dec_module, clean_state, f"decoder from {safe_text(checkpoint_path)}")
 
 
 def make_criterion(args: argparse.Namespace, device: torch.device):
@@ -394,6 +413,8 @@ def train_one_epoch(
         visual_encoder = get_visual_encoder_module(encoder)
         if visual_encoder is not None:
             visual_encoder.eval()
+    if getattr(args, "freeze_decoder_active", False):
+        decoder.eval()
     amp_enabled = device.type == "cuda" and args.amp
     total_loss = 0.0
     num_batches = 0
@@ -604,6 +625,14 @@ def run(args: argparse.Namespace) -> None:
         else:
             print(f"[pretrained-ssl] WARNING: Pretrained SSL path {args.pretrained_ssl} does not exist or is not a file!")
 
+    if getattr(args, "pretrained_decoder", None) is not None:
+        pretrained_decoder_path = resolve_path(args.pretrained_decoder)
+        if pretrained_decoder_path and pretrained_decoder_path.is_file():
+            print(f"[pretrained-decoder] Loading weights from {safe_text(pretrained_decoder_path)}")
+            load_pretrained_decoder(decoder, pretrained_decoder_path, device)
+        else:
+            print(f"[pretrained-decoder] WARNING: path {args.pretrained_decoder} does not exist or is not a file!")
+
     criterion = make_criterion(args, device)
 
     if args.visual_lr_scale is None:
@@ -614,6 +643,8 @@ def run(args: argparse.Namespace) -> None:
         args.decoder_lr_scale = 5.0 if args.decoder_type.lower() == "direct_tcn" else (4.0 if args.decoder_type.lower() == "siren" else 1.0)
     if args.freeze_visual_epochs is None:
         args.freeze_visual_epochs = 2 if args.pretrained_ssl else 0
+    if args.freeze_decoder_epochs is None:
+        args.freeze_decoder_epochs = 5 if args.pretrained_decoder else 0
 
     # Wrap model in nn.DataParallel to utilize all available GPUs
     if device.type == "cuda" and torch.cuda.device_count() > 1:
@@ -676,6 +707,8 @@ def run(args: argparse.Namespace) -> None:
     print(f"[lr] {lr_summary}")
     if args.freeze_visual_epochs > 0:
         print(f"[freeze] visual_encoder frozen for first {args.freeze_visual_epochs} epoch(s)")
+    if args.freeze_decoder_epochs > 0:
+        print(f"[freeze] decoder frozen for first {args.freeze_decoder_epochs} epoch(s)")
     print(
         "[loss] mel=1.0 delta={} delta2={} energy={}".format(
             args.lambda_delta,
@@ -692,10 +725,17 @@ def run(args: argparse.Namespace) -> None:
         freeze_visual = epoch <= args.freeze_visual_epochs
         args.freeze_visual_active = freeze_visual
         set_module_trainable(get_visual_encoder_module(encoder), not freeze_visual)
+        freeze_decoder = epoch <= args.freeze_decoder_epochs
+        args.freeze_decoder_active = freeze_decoder
+        set_module_trainable(unwrap_module(decoder), not freeze_decoder)
         if epoch == 1 and freeze_visual:
             print("[freeze] visual_encoder frozen; training fusion/decoder against BYOL features first")
         elif epoch == args.freeze_visual_epochs + 1 and args.freeze_visual_epochs > 0:
             print("[freeze] visual_encoder unfrozen")
+        if epoch == 1 and freeze_decoder:
+            print("[freeze] decoder frozen; training encoder/fusion into pretrained decoder space")
+        elif epoch == args.freeze_decoder_epochs + 1 and args.freeze_decoder_epochs > 0:
+            print("[freeze] decoder unfrozen")
 
         if args.curriculum:
             current_frames = get_curriculum_frames(epoch, args.epochs, target_max_frames)
@@ -845,10 +885,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Number of warmup epochs for cosine scheduler.")
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning (progressive max_frames).")
     parser.add_argument("--pretrained-ssl", default=None, help="Path to self-supervised pre-trained backbone checkpoint.")
+    parser.add_argument("--pretrained-decoder", default=None, help="Path to decoder checkpoint, e.g. best_decoder_latent.pth from capacity test.")
     parser.add_argument("--visual-lr-scale", type=float, default=None, help="Scale base LR for the visual encoder. Default: 0.25 with SSL, else 1.0.")
     parser.add_argument("--fusion-lr-scale", type=float, default=None, help="Scale base LR for landmark/fusion layers. Default: 1.0.")
     parser.add_argument("--decoder-lr-scale", type=float, default=None, help="Scale base LR for decoder. Default: 5.0 for direct_tcn, 4.0 for siren, else 1.0.")
     parser.add_argument("--freeze-visual-epochs", type=int, default=None, help="Freeze visual encoder for the first N epochs. Default: 2 with SSL, else 0.")
+    parser.add_argument("--freeze-decoder-epochs", type=int, default=None, help="Freeze decoder for the first N epochs. Default: 5 with --pretrained-decoder, else 0.")
     return parser.parse_args()
 
 
