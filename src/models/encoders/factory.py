@@ -21,6 +21,7 @@ FLOW_ENCODER_TYPES = {"ephrat_flow_r2plus1d", "flow_r2plus1d", "two_tower_flow"}
 def is_flow_encoder_type(encoder_type: str) -> bool:
     return str(encoder_type).lower() in FLOW_ENCODER_TYPES
 
+
 def build_encoder(encoder_type="snn", **kwargs):
     encoder_type = encoder_type.lower()
     if encoder_type == "snn":
