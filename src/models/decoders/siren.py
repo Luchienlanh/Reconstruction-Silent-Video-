@@ -85,6 +85,7 @@ class TFiLMSIRENDecoder(nn.Module):
         nn.init.zeros_(self.condition_proj.bias)
         self.time_signal_scale = 0.1
         self.condition_signal_scale = 1.0
+        self.output_condition_scale = 0.5
 
         # Time positional encoding. This is important for mel output; otherwise the
         # decoder tends to learn only an average spectral envelope.
@@ -142,7 +143,7 @@ class TFiLMSIRENDecoder(nn.Module):
 
         for i, layer in enumerate(self.siren_layers):
             X = layer(X, gammas_flat[i], betas_flat[i])
-        out = self.final_layer(X)
+        out = self.final_layer(X + self.output_condition_scale * torch.sin(condition_signal))
         if self.output_activation == "tanh":
             out = torch.tanh(out) * self.output_scale  # waveform range
         elif self.output_activation not in (None, "none", "linear"):

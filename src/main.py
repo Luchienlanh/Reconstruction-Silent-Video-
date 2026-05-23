@@ -36,6 +36,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from data.dataset import VNLipDatasetV2, collate_pad_v2
 from models.encoders.factory import build_encoder, VisualLandmarkEncoder, VisualLandmarkEncoderV2, VisualLandmarkEncoderGatedResidual
 from models.decoders.siren import TFiLMSIRENDecoder
+from models.decoders.direct_tcn import DirectTCNMelDecoder
 from models.decoders.wire import TFiLMWIREDecoder
 from models.decoders.finer import TFiLMFINERDecoder
 from models.decoders.dual import DualDecoder, DualWrapDecoder
@@ -115,10 +116,28 @@ def set_dataset_max_frames(dataset, max_frames: Optional[int]) -> None:
         dataset.max_frames = max_frames
 
 
+def unwrap_module(module: torch.nn.Module) -> torch.nn.Module:
+    return module.module if isinstance(module, torch.nn.DataParallel) else module
+
+
+def get_visual_encoder_module(encoder: torch.nn.Module) -> Optional[torch.nn.Module]:
+    enc_module = unwrap_module(encoder)
+    return getattr(enc_module, "visual_encoder", None)
+
+
+def set_module_trainable(module: Optional[torch.nn.Module], trainable: bool) -> None:
+    if module is None:
+        return
+    for param in module.parameters():
+        param.requires_grad = trainable
+
+
 def build_base_decoder(decoder_type: str, target_type: str = "mel_hifigan"):
     decoder_type = decoder_type.lower()
     common = dict(hidden_dim=256, out_dim=80, num_layers=4, use_conv=True)
     output_act = None if target_type == "mel_hifigan" else "tanh"
+    if decoder_type == "direct_tcn":
+        return DirectTCNMelDecoder(hidden_dim=512, out_dim=80, num_layers=6)
     if decoder_type == "siren":
         return TFiLMSIRENDecoder(**common, output_activation=None)
     if decoder_type == "wire":
@@ -206,6 +225,35 @@ def make_criterion(args: argparse.Namespace, device: torch.device):
         lambda_delta2=args.lambda_delta2,
         lambda_energy=args.lambda_energy,
     ).to(device)
+
+
+def build_optimizer_groups(
+    encoder: torch.nn.Module,
+    decoder: torch.nn.Module,
+    args: argparse.Namespace,
+) -> list[dict]:
+    enc_module = unwrap_module(encoder)
+    visual_encoder = getattr(enc_module, "visual_encoder", None)
+    is_snn = args.encoder_type.lower() == "snn"
+    is_finer = args.decoder_type.lower() == "finer"
+
+    visual_base_lr = args.lr * (2.5 if is_snn else 1.0)
+    visual_lr = visual_base_lr * args.visual_lr_scale
+    fusion_lr = args.lr * args.fusion_lr_scale
+    decoder_lr = args.lr * args.decoder_lr_scale * (0.5 if is_finer else 1.0)
+
+    groups = []
+    if visual_encoder is not None:
+        visual_params = list(visual_encoder.parameters())
+        visual_param_ids = {id(param) for param in visual_params}
+        fusion_params = [param for param in encoder.parameters() if id(param) not in visual_param_ids]
+        groups.append({"params": visual_params, "lr": visual_lr, "name": "visual"})
+        if fusion_params:
+            groups.append({"params": fusion_params, "lr": fusion_lr, "name": "fusion"})
+    else:
+        groups.append({"params": list(encoder.parameters()), "lr": visual_lr, "name": "encoder"})
+    groups.append({"params": list(decoder.parameters()), "lr": decoder_lr, "name": "decoder"})
+    return groups
 
 
 def unpack_batch(batch, device: torch.device, crop_mouth: bool = False, mouth_roi: list[int] = [45, 80, 32, 80]):
@@ -315,9 +363,15 @@ def load_resume(
     dec_module.load_state_dict(ckpt["decoder_state_dict"], strict=True)
     
     if "optimizer_state_dict" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        except ValueError as exc:
+            print(f"[resume] WARNING: optimizer state not loaded ({exc}). Continuing with fresh optimizer.")
     if "scaler_state_dict" in ckpt:
-        scaler.load_state_dict(ckpt["scaler_state_dict"])
+        try:
+            scaler.load_state_dict(ckpt["scaler_state_dict"])
+        except ValueError as exc:
+            print(f"[resume] WARNING: scaler state not loaded ({exc}). Continuing with fresh scaler.")
     start_epoch = int(ckpt.get("epoch", 0)) + 1
     best_val = float(ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf"))))
     return start_epoch, best_val
@@ -336,6 +390,10 @@ def train_one_epoch(
 ) -> float:
     encoder.train()
     decoder.train()
+    if getattr(args, "freeze_visual_active", False):
+        visual_encoder = get_visual_encoder_module(encoder)
+        if visual_encoder is not None:
+            visual_encoder.eval()
     amp_enabled = device.type == "cuda" and args.amp
     total_loss = 0.0
     num_batches = 0
@@ -548,24 +606,22 @@ def run(args: argparse.Namespace) -> None:
 
     criterion = make_criterion(args, device)
 
+    if args.visual_lr_scale is None:
+        args.visual_lr_scale = 0.25 if args.pretrained_ssl else 1.0
+    if args.fusion_lr_scale is None:
+        args.fusion_lr_scale = 1.0
+    if args.decoder_lr_scale is None:
+        args.decoder_lr_scale = 5.0 if args.decoder_type.lower() == "direct_tcn" else (4.0 if args.decoder_type.lower() == "siren" else 1.0)
+    if args.freeze_visual_epochs is None:
+        args.freeze_visual_epochs = 2 if args.pretrained_ssl else 0
+
     # Wrap model in nn.DataParallel to utilize all available GPUs
     if device.type == "cuda" and torch.cuda.device_count() > 1:
         print(f"[device] Found {torch.cuda.device_count()} GPUs. Wrapping modules in nn.DataParallel!")
         encoder = torch.nn.DataParallel(encoder)
         decoder = torch.nn.DataParallel(decoder)
 
-    # Implement parameter groups learning rate split from the optimization plan:
-    # Scale learning rate up for discrete SNN gradients, scale down for sensitive FINER decoders.
-    is_snn = args.encoder_type.lower() == "snn"
-    is_finer = args.decoder_type.lower() == "finer"
-
-    encoder_lr = args.lr * 2.5 if is_snn else args.lr
-    decoder_lr = args.lr * 0.5 if is_finer else args.lr
-
-    optimizer_groups = [
-        {"params": encoder.parameters(), "lr": encoder_lr},
-        {"params": decoder.parameters(), "lr": decoder_lr}
-    ]
+    optimizer_groups = build_optimizer_groups(encoder, decoder, args)
 
     optimizer = torch.optim.AdamW(
         optimizer_groups,
@@ -579,7 +635,7 @@ def run(args: argparse.Namespace) -> None:
         steps_per_epoch = int(math.ceil(len(train_loader) / args.accum_steps))
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=[encoder_lr, decoder_lr],
+            max_lr=[group["lr"] for group in optimizer_groups],
             epochs=args.epochs,
             steps_per_epoch=steps_per_epoch,
             pct_start=0.1,  # 10% warmup
@@ -616,7 +672,10 @@ def run(args: argparse.Namespace) -> None:
     print(f"[data] {safe_text(resolve_path(args.data_dir))}")
     print(f"[split] train={train_count} val={val_count}")
     print(f"[model] encoder={args.encoder_type} decoder={args.decoder_type} landmarks={dataset.landmark_num_points}")
-    print(f"[lr] encoder_lr={encoder_lr:.2e} decoder_lr={decoder_lr:.2e}")
+    lr_summary = ", ".join(f"{group.get('name', idx)}={group['lr']:.2e}" for idx, group in enumerate(optimizer_groups))
+    print(f"[lr] {lr_summary}")
+    if args.freeze_visual_epochs > 0:
+        print(f"[freeze] visual_encoder frozen for first {args.freeze_visual_epochs} epoch(s)")
     print(
         "[loss] mel=1.0 delta={} delta2={} energy={}".format(
             args.lambda_delta,
@@ -630,6 +689,14 @@ def run(args: argparse.Namespace) -> None:
 
     history = []
     for epoch in range(start_epoch, args.epochs + 1):
+        freeze_visual = epoch <= args.freeze_visual_epochs
+        args.freeze_visual_active = freeze_visual
+        set_module_trainable(get_visual_encoder_module(encoder), not freeze_visual)
+        if epoch == 1 and freeze_visual:
+            print("[freeze] visual_encoder frozen; training fusion/decoder against BYOL features first")
+        elif epoch == args.freeze_visual_epochs + 1 and args.freeze_visual_epochs > 0:
+            print("[freeze] visual_encoder unfrozen")
+
         if args.curriculum:
             current_frames = get_curriculum_frames(epoch, args.epochs, target_max_frames)
             set_dataset_max_frames(dataset, current_frames)
@@ -747,7 +814,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decoder-type",
         default="siren",
-        choices=["siren", "wire", "finer", "dual", "dual_wrap", "wrap_siren", "wrap_fisin", "wrap", "wrap_wire", "wrap_fiwi"],
+        choices=["siren", "direct_tcn", "wire", "finer", "dual", "dual_wrap", "wrap_siren", "wrap_fisin", "wrap", "wrap_wire", "wrap_fiwi"],
     )
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--epochs", type=int, default=100)
@@ -760,9 +827,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--lambda-delta", type=float, default=0.0)
-    parser.add_argument("--lambda-delta2", type=float, default=0.0)
-    parser.add_argument("--lambda-energy", type=float, default=0.0)
+    parser.add_argument("--lambda-delta", type=float, default=0.25)
+    parser.add_argument("--lambda-delta2", type=float, default=0.05)
+    parser.add_argument("--lambda-energy", type=float, default=0.05)
     parser.add_argument("--val-every", type=int, default=1)
     parser.add_argument("--plot-every", type=int, default=5)
     parser.add_argument("--save-every", type=int, default=10)
@@ -778,6 +845,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Number of warmup epochs for cosine scheduler.")
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning (progressive max_frames).")
     parser.add_argument("--pretrained-ssl", default=None, help="Path to self-supervised pre-trained backbone checkpoint.")
+    parser.add_argument("--visual-lr-scale", type=float, default=None, help="Scale base LR for the visual encoder. Default: 0.25 with SSL, else 1.0.")
+    parser.add_argument("--fusion-lr-scale", type=float, default=None, help="Scale base LR for landmark/fusion layers. Default: 1.0.")
+    parser.add_argument("--decoder-lr-scale", type=float, default=None, help="Scale base LR for decoder. Default: 5.0 for direct_tcn, 4.0 for siren, else 1.0.")
+    parser.add_argument("--freeze-visual-epochs", type=int, default=None, help="Freeze visual encoder for the first N epochs. Default: 2 with SSL, else 0.")
     return parser.parse_args()
 
 

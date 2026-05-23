@@ -35,6 +35,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from data.dataset import VNLipDatasetV2, collate_pad_v2  # noqa: E402
+from models.decoders.direct_tcn import DirectTCNMelDecoder  # noqa: E402
 from models.decoders.dual import DualDecoder, DualWrapDecoder  # noqa: E402
 from models.decoders.finer import TFiLMFINERDecoder  # noqa: E402
 from models.decoders.siren import TFiLMSIRENDecoder  # noqa: E402
@@ -87,6 +88,8 @@ def build_base_decoder(decoder_type: str, target_type: str = "mel_hifigan"):
     decoder_type = decoder_type.lower()
     common = dict(hidden_dim=256, out_dim=80, num_layers=4, use_conv=True)
     output_act = None if target_type == "mel_hifigan" else "tanh"
+    if decoder_type == "direct_tcn":
+        return DirectTCNMelDecoder(hidden_dim=512, out_dim=80, num_layers=6)
     if decoder_type == "siren":
         return TFiLMSIRENDecoder(**common, output_activation=None)
     if decoder_type == "wire":
@@ -536,7 +539,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decoder-type",
         default=None,
-        choices=["siren", "wire", "finer", "dual", "dual_wrap", "wrap_siren", "wrap_fisin", "wrap", "wrap_wire", "wrap_fiwi"],
+        choices=["siren", "direct_tcn", "wire", "finer", "dual", "dual_wrap", "wrap_siren", "wrap_fisin", "wrap", "wrap_wire", "wrap_fiwi"],
     )
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--fusion-type", default=None, choices=["concat", "cross_attn", "gated_residual"], help="Must match training config.")
