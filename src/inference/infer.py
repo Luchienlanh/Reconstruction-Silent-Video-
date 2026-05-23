@@ -41,7 +41,7 @@ from models.decoders.siren import TFiLMSIRENDecoder  # noqa: E402
 from models.decoders.upsample import MelTemporalUpsampleDecoder  # noqa: E402
 from models.decoders.wire import TFiLMWIREDecoder  # noqa: E402
 from models.decoders.wrap import TFiLMWrapFISINDecoder, TFiLMWrapFIWIDecoder  # noqa: E402
-from models.encoders.factory import VisualLandmarkEncoder, VisualLandmarkEncoderV2, build_encoder  # noqa: E402
+from models.encoders.factory import VisualLandmarkEncoder, VisualLandmarkEncoderV2, VisualLandmarkEncoderGatedResidual, build_encoder  # noqa: E402
 
 DEFAULT_HIFIGAN_SOURCE = "speechbrain/tts-hifigan-libritts-16kHz"
 DEFAULT_HIFIGAN_SAVEDIR = PROJECT_ROOT / "pretrained_models" / "tts-hifigan-libritts-16kHz"
@@ -108,6 +108,12 @@ def build_models(device: torch.device, encoder_type: str, decoder_type: str, num
     visual_encoder = build_encoder(encoder_type).to(device)
     if fusion_type == "concat":
         encoder = VisualLandmarkEncoder(
+            visual_encoder,
+            num_landmark_points=num_landmark_points,
+            z_dim=512,
+        ).to(device)
+    elif fusion_type == "gated_residual":
+        encoder = VisualLandmarkEncoderGatedResidual(
             visual_encoder,
             num_landmark_points=num_landmark_points,
             z_dim=512,
@@ -526,14 +532,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--max-frames", type=int, default=None, help="0 or negative means full sample.")
-    parser.add_argument("--encoder-type", default=None, choices=["non_snn", "nonsnn", "cnn_transformer", "snn"])
+    parser.add_argument("--encoder-type", default=None, choices=["non_snn", "nonsnn", "cnn_transformer", "snn", "resnet18_temporal", "resnet2plus1d_spatial_motion"])
     parser.add_argument(
         "--decoder-type",
         default=None,
         choices=["siren", "wire", "finer", "dual", "dual_wrap", "wrap_siren", "wrap_fisin", "wrap", "wrap_wire", "wrap_fiwi"],
     )
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--fusion-type", default=None, choices=["concat", "cross_attn"], help="Must match training config.")
+    parser.add_argument("--fusion-type", default=None, choices=["concat", "cross_attn", "gated_residual"], help="Must match training config.")
     parser.add_argument("--crop-mouth", action="store_true", help="Crop mouth region from video frames (must match training).")
     parser.add_argument("--mouth-roi", type=int, nargs=4, default=[45, 80, 32, 80], metavar=("Y1", "Y2", "X1", "X2"), help="Mouth ROI [y1 y2 x1 x2].")
     parser.add_argument("--force-full-frame", default=None, action=argparse.BooleanOptionalAction)

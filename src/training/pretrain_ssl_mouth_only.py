@@ -387,7 +387,7 @@ def main():
     parser.add_argument("--output-dir", type=str, default="checkpoints_byol",
                         help="Checkpoint output directory")
     parser.add_argument("--encoder-type", type=str, default="non_snn",
-                        choices=["non_snn", "snn", "resnet18_temporal"],
+                        choices=["non_snn", "snn", "resnet18_temporal", "resnet2plus1d_spatial_motion"],
                         help="Backbone encoder type")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-frames", type=int, default=30)

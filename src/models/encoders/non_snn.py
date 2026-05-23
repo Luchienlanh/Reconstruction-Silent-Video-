@@ -92,16 +92,17 @@ class NonSpikingBasicBlock(nn.Module):
 
 class NonSpikingVidResNet(nn.Module):
     def __init__(self, block=NonSpikingBasicBlock, conv_makers=[NonSpikingConv2DPlus1D] * 4,
-                 layers=[2, 2, 2, 2], zero_init_residual: bool=False):
+                 layers=[2, 2, 2, 2], zero_init_residual: bool=False, spatial_pool_size: int=1):
         super().__init__()
         self.in_channels = 64
+        self.spatial_pool_size = spatial_pool_size
         self.stem = NonSpikingDirectEncoder(in_channels=1, out_channels=64)
         self.layer1 = self._make_layer(block, 64, conv_makers[0], layers[0], stride=1)
         self.layer2 = self._make_layer(block, 128, conv_makers[1], layers[1], stride=1)
         self.layer3 = self._make_layer(block, 256, conv_makers[2], layers[2], stride=1)
         self.layer4 = self._make_layer(block, 512, conv_makers[3], layers[3], stride=1)
-        self.avgpool = nn.AdaptiveAvgPool3d((None, 1, 1))
-        self.fc = nn.Linear(512 * block.expansion, 512)
+        self.avgpool = nn.AdaptiveAvgPool3d((None, spatial_pool_size, spatial_pool_size))
+        self.fc = nn.Linear(512 * block.expansion * spatial_pool_size * spatial_pool_size, 512)
 
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
@@ -142,8 +143,7 @@ class NonSpikingVidResNet(nn.Module):
         X = self.layer3(X)
         X = self.layer4(X)
         X = self.avgpool(X)
-        X = X.squeeze(-1).squeeze(-1)  # (B, C, T)
-        X = X.permute(0, 2, 1)        # (B, T, C)
+        X = X.permute(0, 2, 1, 3, 4).flatten(start_dim=2)  # (B, T, C*H_pool*W_pool)
         return self.fc(X)
 
 class NonSpikingTemporalEncoder(nn.Module):
@@ -181,6 +181,44 @@ class NonSpikingViTEncoder(nn.Module):
         features = self.backbone(X)  # (B, T, 512)
         if features.size(1) > self.pos_embedding.size(1):
             raise ValueError(f"T={features.size(1)} v??t T_max={self.pos_embedding.size(1)}")
+        features = features + self.pos_embedding[:, :features.size(1), :]
+        features = self.temporal(features)
+        return self.norm(features)
+
+class ResNet2Plus1DSpatialMotionEncoder(nn.Module):
+    def __init__(self, z_dim=512, n_heads=8, n_blocks=4, mlp_hidden_dim=2048, T_max=1000, dropout=0.1):
+        super().__init__()
+        self.pos_embedding = nn.Parameter(torch.randn(1, T_max, z_dim) * 0.02)
+        self.backbone = NonSpikingVidResNet(spatial_pool_size=2)
+        self.motion_proj = nn.Sequential(
+            nn.Linear(z_dim * 3, z_dim),
+            nn.LayerNorm(z_dim),
+            nn.SiLU(),
+        )
+        self.temporal = NonSpikingTemporalEncoder(
+            z_dim=z_dim,
+            n_heads=n_heads,
+            n_blocks=n_blocks,
+            mlp_hidden_dim=mlp_hidden_dim,
+            dropout=dropout,
+        )
+        self.norm = nn.LayerNorm(z_dim)
+
+    @staticmethod
+    def _delta(x: Tensor) -> Tensor:
+        if x.shape[1] <= 1:
+            return torch.zeros_like(x)
+        d = torch.zeros_like(x)
+        d[:, 1:] = x[:, 1:] - x[:, :-1]
+        return d
+
+    def forward(self, X: Tensor) -> Tensor:
+        features = self.backbone(X)  # (B, T, 512)
+        if features.size(1) > self.pos_embedding.size(1):
+            raise ValueError(f"T={features.size(1)} exceeds T_max={self.pos_embedding.size(1)}")
+        d1 = self._delta(features)
+        d2 = self._delta(d1)
+        features = self.motion_proj(torch.cat([features, d1, d2], dim=-1))
         features = features + self.pos_embedding[:, :features.size(1), :]
         features = self.temporal(features)
         return self.norm(features)

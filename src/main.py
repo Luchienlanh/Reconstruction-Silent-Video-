@@ -34,7 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # Import modular components
 from data.dataset import VNLipDatasetV2, collate_pad_v2
-from models.encoders.factory import build_encoder, VisualLandmarkEncoder, VisualLandmarkEncoderV2
+from models.encoders.factory import build_encoder, VisualLandmarkEncoder, VisualLandmarkEncoderV2, VisualLandmarkEncoderGatedResidual
 from models.decoders.siren import TFiLMSIRENDecoder
 from models.decoders.wire import TFiLMWIREDecoder
 from models.decoders.finer import TFiLMFINERDecoder
@@ -144,6 +144,12 @@ def build_models(device: torch.device, encoder_type: str, decoder_type: str, num
             num_landmark_points=num_landmark_points,
             z_dim=512,
         ).to(device)
+    elif fusion_type == "gated_residual":
+        encoder = VisualLandmarkEncoderGatedResidual(
+            visual_encoder,
+            num_landmark_points=num_landmark_points,
+            z_dim=512,
+        ).to(device)
     else:
         encoder = VisualLandmarkEncoderV2(
             visual_encoder,
@@ -159,6 +165,38 @@ def build_models(device: torch.device, encoder_type: str, decoder_type: str, num
         hop_length=256,
     ).to(device)
     return encoder, decoder
+
+
+def load_compatible_state_dict(module: torch.nn.Module, state_dict: dict, tag: str):
+    target_state = module.state_dict()
+    compatible = {}
+    skipped = []
+    unexpected = []
+
+    for key, value in state_dict.items():
+        clean_key = key.removeprefix("module.")
+        if clean_key not in target_state:
+            unexpected.append(clean_key)
+            continue
+        if hasattr(value, "shape") and target_state[clean_key].shape != value.shape:
+            skipped.append((clean_key, tuple(value.shape), tuple(target_state[clean_key].shape)))
+            continue
+        compatible[clean_key] = value
+
+    missing_keys, unexpected_keys = module.load_state_dict(compatible, strict=False)
+    print(
+        f"[pretrained-ssl] {tag}: loaded={len(compatible)} "
+        f"missing={len(missing_keys)} unexpected={len(unexpected) + len(unexpected_keys)} skipped_shape={len(skipped)}"
+    )
+    if missing_keys:
+        print(f"[pretrained-ssl] {tag} missing (first 8): {missing_keys[:8]}")
+    combined_unexpected = unexpected + list(unexpected_keys)
+    if combined_unexpected:
+        print(f"[pretrained-ssl] {tag} unexpected (first 8): {combined_unexpected[:8]}")
+    if skipped:
+        formatted = [f"{k}: ckpt{src}->model{dst}" for k, src, dst in skipped[:8]]
+        print(f"[pretrained-ssl] {tag} skipped shape mismatch (first 8): {formatted}")
+    return missing_keys, combined_unexpected, skipped
 
 
 def make_criterion(args: argparse.Namespace, device: torch.device):
@@ -480,43 +518,29 @@ def run(args: argparse.Namespace) -> None:
             if not hasattr(encoder, "visual_encoder"):
                 print("[pretrained-ssl] WARNING: Could not locate visual_encoder in encoder!")
             elif isinstance(checkpoint, dict) and "online_encoder_state_dict" in checkpoint:
-                missing_keys, unexpected_keys = encoder.visual_encoder.load_state_dict(
+                load_compatible_state_dict(
+                    encoder.visual_encoder,
                     checkpoint["online_encoder_state_dict"],
-                    strict=False,
+                    "visual_encoder from online_encoder_state_dict",
                 )
-                print("[pretrained-ssl] Visual encoder loaded successfully from online_encoder_state_dict!")
-                if len(missing_keys) > 0:
-                    print(f"[pretrained-ssl] Missing keys (first 5): {missing_keys[:5]}")
-                if len(unexpected_keys) > 0:
-                    print(f"[pretrained-ssl] Unexpected keys (first 5): {unexpected_keys[:5]}")
             elif isinstance(checkpoint, dict) and "visual_encoder" in checkpoint:
-                missing_keys, unexpected_keys = encoder.visual_encoder.load_state_dict(
+                load_compatible_state_dict(
+                    encoder.visual_encoder,
                     checkpoint["visual_encoder"],
-                    strict=False,
+                    "visual_encoder",
                 )
-                print("[pretrained-ssl] Visual encoder loaded successfully!")
-                if len(missing_keys) > 0:
-                    print(f"[pretrained-ssl] Missing keys (first 5): {missing_keys[:5]}")
-                if len(unexpected_keys) > 0:
-                    print(f"[pretrained-ssl] Unexpected keys (first 5): {unexpected_keys[:5]}")
             elif isinstance(checkpoint, dict) and "backbone" in checkpoint and checkpoint["backbone"] is not None:
-                missing_keys, unexpected_keys = encoder.visual_encoder.backbone.load_state_dict(
+                load_compatible_state_dict(
+                    encoder.visual_encoder.backbone,
                     checkpoint["backbone"],
-                    strict=False,
+                    "visual_encoder.backbone",
                 )
-                print("[pretrained-ssl] Backbone loaded successfully!")
-                if len(missing_keys) > 0:
-                    print(f"[pretrained-ssl] Missing keys (first 5): {missing_keys[:5]}")
-                if len(unexpected_keys) > 0:
-                    print(f"[pretrained-ssl] Unexpected keys (first 5): {unexpected_keys[:5]}")
             elif isinstance(checkpoint, dict) and all(torch.is_tensor(value) for value in checkpoint.values()):
-                target_state = checkpoint
-                missing_keys, unexpected_keys = encoder.visual_encoder.load_state_dict(target_state, strict=False)
-                print("[pretrained-ssl] Raw state dict loaded into visual encoder!")
-                if len(missing_keys) > 0:
-                    print(f"[pretrained-ssl] Missing keys (first 5): {missing_keys[:5]}")
-                if len(unexpected_keys) > 0:
-                    print(f"[pretrained-ssl] Unexpected keys (first 5): {unexpected_keys[:5]}")
+                load_compatible_state_dict(
+                    encoder.visual_encoder,
+                    checkpoint,
+                    "visual_encoder from raw state_dict",
+                )
             else:
                 print("[pretrained-ssl] WARNING: Unsupported SSL checkpoint format.")
         else:
@@ -719,7 +743,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-output-dir", default="Dataset_Output")
     parser.add_argument("--output-dir", default="checkpoints_modular")
     parser.add_argument("--resume", default=None)
-    parser.add_argument("--encoder-type", default="non_snn", choices=["non_snn", "nonsnn", "cnn_transformer", "snn", "resnet18_temporal"])
+    parser.add_argument("--encoder-type", default="non_snn", choices=["non_snn", "nonsnn", "cnn_transformer", "snn", "resnet18_temporal", "resnet2plus1d_spatial_motion"])
     parser.add_argument(
         "--decoder-type",
         default="siren",
@@ -749,7 +773,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-fallback", action="store_true")
     parser.add_argument("--crop-mouth", action="store_true", help="Crop mouth region of interest from the input video.")
     parser.add_argument("--mouth-roi", type=int, nargs=4, default=[45, 80, 32, 80], help="Mouth ROI y1, y2, x1, x2")
-    parser.add_argument("--fusion-type", default="cross_attn", choices=["concat", "cross_attn"], help="Landmark fusion type.")
+    parser.add_argument("--fusion-type", default="cross_attn", choices=["concat", "cross_attn", "gated_residual"], help="Landmark fusion type.")
     parser.add_argument("--lr-scheduler", default="constant", choices=["constant", "onecycle", "cosine"], help="Learning rate scheduler type.")
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Number of warmup epochs for cosine scheduler.")
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning (progressive max_frames).")

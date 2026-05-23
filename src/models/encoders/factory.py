@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 from .snn import SpikingViTEncoder
-from .non_snn import NonSpikingViTEncoder, ResNet18TemporalEncoder
+from .non_snn import NonSpikingViTEncoder, ResNet18TemporalEncoder, ResNet2Plus1DSpatialMotionEncoder
 
 def build_encoder(encoder_type="snn", **kwargs):
     encoder_type = encoder_type.lower()
@@ -21,6 +21,8 @@ def build_encoder(encoder_type="snn", **kwargs):
         return SpikingViTEncoder(**kwargs)
     if encoder_type in {"non_snn", "nonsnn", "cnn_transformer"}:
         return NonSpikingViTEncoder(**kwargs)
+    if encoder_type == "resnet2plus1d_spatial_motion":
+        return ResNet2Plus1DSpatialMotionEncoder(**kwargs)
     if encoder_type == "resnet18_temporal":
         return ResNet18TemporalEncoder(**kwargs)
     raise ValueError(f"Unknown ENCODER_TYPE: {encoder_type}")
@@ -200,4 +202,45 @@ class VisualLandmarkEncoderV2(nn.Module):
         out = self.norm2(x + ffn_out)
         
         return out
+
+class VisualLandmarkEncoderGatedResidual(nn.Module):
+    """Fuse visual and landmark features with video as the residual path."""
+
+    def __init__(self, visual_encoder: nn.Module, num_landmark_points: int, z_dim: int = 512, hidden_dim: int = 512, dropout: float = 0.1):
+        super().__init__()
+        self.visual_encoder = visual_encoder
+        self.landmark_encoder = LandmarkEncoder(num_landmark_points, out_dim=z_dim, dropout=dropout)
+        self.landmark_encoder_v2 = LandmarkEncoderV2(num_landmark_points, out_dim=z_dim, dropout=dropout)
+        self.landmark_proj = nn.Linear(z_dim, z_dim)
+        self.gate = nn.Sequential(
+            nn.Linear(z_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, z_dim),
+        )
+        self.norm = nn.LayerNorm(z_dim)
+
+        nn.init.zeros_(self.landmark_proj.bias)
+        nn.init.constant_(self.gate[-1].bias, -2.0)
+
+    def forward(self, video: torch.Tensor, landmarks: torch.Tensor = None) -> torch.Tensor:
+        if landmarks is None:
+            raise ValueError("VisualLandmarkEncoderGatedResidual requires landmarks.")
+
+        z_video = self.visual_encoder(video)
+        if landmarks.shape[-1] == 6:
+            z_landmark = self.landmark_encoder_v2(landmarks)
+        else:
+            z_landmark = self.landmark_encoder(landmarks)
+
+        if z_landmark.shape[1] != z_video.shape[1]:
+            z_landmark = F.interpolate(
+                z_landmark.transpose(1, 2),
+                size=z_video.shape[1],
+                mode="linear",
+                align_corners=False,
+            ).transpose(1, 2).contiguous()
+
+        gate = torch.sigmoid(self.gate(torch.cat([z_video, z_landmark], dim=-1)))
+        return self.norm(z_video + gate * self.landmark_proj(z_landmark))
 
