@@ -272,6 +272,10 @@ class VNLipDatasetV2(Dataset):
         force_full_frame: bool = False,
         lost_frame_threshold: float = 0.01,
         use_offline_features: bool = False,
+        use_optical_flow: bool = False,
+        flow_cache_dir: Optional[str] = None,
+        flow_method: str = "farneback",
+        flow_scale: float = 10.0,
     ):
         self.data_dir = data_dir
         self.max_frames = max_frames
@@ -283,10 +287,17 @@ class VNLipDatasetV2(Dataset):
         self.force_full_frame = force_full_frame
         self.lost_frame_threshold = lost_frame_threshold
         self.use_offline_features = use_offline_features
+        self.use_optical_flow = use_optical_flow
+        self.flow_method = flow_method
+        self.flow_scale = max(float(flow_scale), 1e-6)
+        self.flow_cache_dir = flow_cache_dir
         self.landmark_num_points = None
+        self._flow_warned = False
 
         if not os.path.isdir(self.data_dir):
             raise FileNotFoundError(f"Khong tim thay data_dir: {self.data_dir}")
+        if self.use_optical_flow and self.flow_cache_dir:
+            os.makedirs(self.flow_cache_dir, exist_ok=True)
 
         self.files = sorted(f for f in os.listdir(self.data_dir) if f.endswith(".pt"))
         if len(self.files) == 0:
@@ -389,7 +400,95 @@ class VNLipDatasetV2(Dataset):
                 full_frames[0, t] = face_frame
         return full_frames
 
-    def _crop(self, video, target, target_len, landmarks=None, data=None):
+    def _flow_cache_path(self, file_name: str) -> Optional[str]:
+        if not self.flow_cache_dir:
+            return None
+        stem = os.path.splitext(os.path.basename(file_name))[0]
+        return os.path.join(self.flow_cache_dir, f"{stem}.flow.pt")
+
+    def _video_to_uint8(self, video: torch.Tensor) -> np.ndarray:
+        # video: (C, T, H, W). Flow uses the first/mean grayscale channel.
+        x = video.detach().float()
+        if x.shape[0] > 1:
+            x = x.mean(dim=0)
+        else:
+            x = x[0]
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        x_min = float(x.amin())
+        x_max = float(x.amax())
+        if x_max <= 1.5 and x_min >= -0.5:
+            x = x.clamp(0.0, 1.0) * 255.0
+        else:
+            x = x.clamp(0.0, 255.0)
+        return x.byte().cpu().numpy()
+
+    def _pseudo_flow(self, frames: np.ndarray) -> torch.Tensor:
+        frames_f = frames.astype(np.float32) / 255.0
+        t, h, w = frames_f.shape
+        flow = np.zeros((2, t, h, w), dtype=np.float32)
+        for i in range(1, t):
+            dt = frames_f[i] - frames_f[i - 1]
+            gy, gx = np.gradient(frames_f[i])
+            flow[0, i] = dt * gx
+            flow[1, i] = dt * gy
+        return torch.from_numpy(flow)
+
+    def _compute_optical_flow(self, video: torch.Tensor) -> torch.Tensor:
+        frames = self._video_to_uint8(video)
+        t, h, w = frames.shape
+        if t <= 1:
+            return torch.zeros(2, t, h, w, dtype=torch.float32)
+
+        if self.flow_method == "pseudo":
+            return self._pseudo_flow(frames)
+
+        try:
+            import cv2
+        except Exception:
+            if not self._flow_warned:
+                warnings.warn("cv2 is not available; using pseudo optical flow fallback.")
+                self._flow_warned = True
+            return self._pseudo_flow(frames)
+
+        flow = np.zeros((2, t, h, w), dtype=np.float32)
+        for i in range(1, t):
+            f = cv2.calcOpticalFlowFarneback(
+                frames[i - 1],
+                frames[i],
+                None,
+                pyr_scale=0.5,
+                levels=3,
+                winsize=15,
+                iterations=3,
+                poly_n=5,
+                poly_sigma=1.2,
+                flags=0,
+            )
+            flow[0, i] = f[..., 0] / self.flow_scale
+            flow[1, i] = f[..., 1] / self.flow_scale
+        flow = np.clip(flow, -5.0, 5.0)
+        return torch.from_numpy(flow)
+
+    def _load_or_compute_flow(self, video: torch.Tensor, file_name: str) -> torch.Tensor:
+        cache_path = self._flow_cache_path(file_name)
+        if cache_path and os.path.isfile(cache_path):
+            cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+            if isinstance(cached, dict):
+                cached = cached.get("flow", cached.get("optical_flow"))
+            if torch.is_tensor(cached) and cached.dim() == 4 and cached.shape[0] == 2:
+                if (
+                    cached.shape[1] == video.shape[1]
+                    and cached.shape[2] == video.shape[2]
+                    and cached.shape[3] == video.shape[3]
+                ):
+                    return cached.float()
+
+        flow = self._compute_optical_flow(video).float()
+        if cache_path:
+            torch.save({"flow": flow}, cache_path)
+        return flow
+
+    def _crop(self, video, target, target_len, landmarks=None, data=None, flow=None):
         is_features = (video.dim() == 2)  # (T, D) shape
         raw_video_len = video.shape[0] if is_features else video.shape[1]
         
@@ -401,13 +500,15 @@ class VNLipDatasetV2(Dataset):
             video = video[:video_len]
         else:
             video = video[:, :video_len]
+        if flow is not None:
+            flow = flow[:, :video_len]
             
         target = target[:target_len]
         if landmarks is not None:
             landmarks = landmarks[:video_len]
 
         if self.max_frames is None or video_len <= self.max_frames:
-            return video, target, landmarks
+            return video, target, landmarks, flow
 
         if self.random_crop:
             start = random.randint(0, video_len - self.max_frames)
@@ -424,11 +525,13 @@ class VNLipDatasetV2(Dataset):
             video = video[start:end]
         else:
             video = video[:, start:end]
+        if flow is not None:
+            flow = flow[:, start:end]
             
         target = target[target_start:target_end]
         if landmarks is not None:
             landmarks = landmarks[start:end]
-        return video, target, landmarks
+        return video, target, landmarks, flow
 
     def __getitem__(self, idx: int):
         file_name = self.files[idx]
@@ -464,6 +567,10 @@ class VNLipDatasetV2(Dataset):
                 if lost_mask.any():
                     video = self._apply_fallback(video, lost_mask, file_name)
 
+        flow = None
+        if self.use_optical_flow and not use_offline:
+            flow = self._load_or_compute_flow(video, file_name)
+
         # --- Landmarks ---
         landmarks = None
         if self.use_landmarks:
@@ -474,11 +581,15 @@ class VNLipDatasetV2(Dataset):
             # Compute derivatives: (T, N, 2) -> (T, N, 6)
             landmarks = compute_landmark_derivatives(lm_raw)
 
-        video, target, landmarks = self._crop(video, target, target_len, landmarks=landmarks, data=data)
+        video, target, landmarks, flow = self._crop(video, target, target_len, landmarks=landmarks, data=data, flow=flow)
 
         if self.use_landmarks:
             if self.return_path:
+                if flow is not None:
+                    return video, flow, landmarks, target, file_path
                 return video, landmarks, target, file_path
+            if flow is not None:
+                return video, flow, landmarks, target
             return video, landmarks, target
         if self.return_path:
             return video, target, file_path
@@ -492,14 +603,30 @@ def collate_pad_v2(batch):
     Supports visual feature sequences (T, 512) and raw videos (C, T, H, W).
     """
     has_path = isinstance(batch[0][-1], str)
-    # Detect landmarks: 4D tensor with last dim = 6 or 2
+    sample_payload = batch[0][:-1] if has_path else batch[0]
+    has_flow = (
+        len(sample_payload) >= 4
+        and torch.is_tensor(sample_payload[1])
+        and sample_payload[1].dim() == 4
+        and torch.is_tensor(sample_payload[2])
+        and sample_payload[2].dim() == 3
+    )
     has_landmarks = (
-        len(batch[0]) >= 3
-        and torch.is_tensor(batch[0][1])
-        and batch[0][1].dim() == 3
+        (has_flow and len(sample_payload) >= 4)
+        or (
+            len(sample_payload) >= 3
+            and torch.is_tensor(sample_payload[1])
+            and sample_payload[1].dim() == 3
+        )
     )
 
-    if has_landmarks and has_path:
+    flows = None
+    if has_flow and has_path:
+        videos, flows, landmarks, targets, paths = zip(*batch)
+    elif has_flow:
+        videos, flows, landmarks, targets = zip(*batch)
+        paths = None
+    elif has_landmarks and has_path:
         videos, landmarks, targets, paths = zip(*batch)
     elif has_landmarks:
         videos, landmarks, targets = zip(*batch)
@@ -519,6 +646,7 @@ def collate_pad_v2(batch):
     T_target_max = int(target_lengths.max().item())
 
     padded_videos = []
+    padded_flows = []
     padded_targets = []
     padded_landmarks = []
 
@@ -544,6 +672,13 @@ def collate_pad_v2(batch):
         padded_videos.append(v)
         padded_targets.append(t)
 
+        if has_flow:
+            fl = flows[i]
+            if fl.shape[1] < T_video_max:
+                pad_fl = torch.zeros(fl.shape[0], T_video_max - fl.shape[1], fl.shape[2], fl.shape[3], dtype=fl.dtype)
+                fl = torch.cat([fl, pad_fl], dim=1)
+            padded_flows.append(fl)
+
         if has_landmarks:
             lm = landmarks[i]
             if lm.shape[0] < T_video_max:
@@ -556,10 +691,15 @@ def collate_pad_v2(batch):
             padded_landmarks.append(lm)
 
     video_batches = torch.stack(padded_videos, dim=0)
+    flow_batches = torch.stack(padded_flows, dim=0) if has_flow else None
     target_batches = torch.stack(padded_targets, dim=0)
 
     if has_landmarks:
         landmark_batches = torch.stack(padded_landmarks, dim=0)  # (B, T, N, 6)
+        if has_flow:
+            if has_path:
+                return video_batches, flow_batches, landmark_batches, target_batches, target_lengths, list(paths)
+            return video_batches, flow_batches, landmark_batches, target_batches, target_lengths
         if has_path:
             return video_batches, landmark_batches, target_batches, target_lengths, list(paths)
         return video_batches, landmark_batches, target_batches, target_lengths

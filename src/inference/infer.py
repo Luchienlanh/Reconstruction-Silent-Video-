@@ -48,6 +48,7 @@ from models.encoders.factory import (  # noqa: E402
     VisualLandmarkEncoderGatedResidual,
     VisualLandmarkEncoderLandmarkFirst,
     build_encoder,
+    is_flow_encoder_type,
 )
 
 DEFAULT_HIFIGAN_SOURCE = "speechbrain/tts-hifigan-libritts-16kHz"
@@ -130,31 +131,34 @@ def build_models(
     decoder_num_layers: int = 4,
     decoder_dropout: float = 0.0,
 ):
-    visual_encoder = build_encoder(encoder_type).to(device)
-    if fusion_type == "concat":
-        encoder = VisualLandmarkEncoder(
-            visual_encoder,
-            num_landmark_points=num_landmark_points,
-            z_dim=512,
-        ).to(device)
-    elif fusion_type == "gated_residual":
-        encoder = VisualLandmarkEncoderGatedResidual(
-            visual_encoder,
-            num_landmark_points=num_landmark_points,
-            z_dim=512,
-        ).to(device)
-    elif fusion_type == "landmark_first":
-        encoder = VisualLandmarkEncoderLandmarkFirst(
-            visual_encoder,
-            num_landmark_points=num_landmark_points,
-            z_dim=512,
-        ).to(device)
+    if is_flow_encoder_type(encoder_type):
+        encoder = build_encoder(encoder_type, num_landmark_points=num_landmark_points).to(device)
     else:
-        encoder = VisualLandmarkEncoderV2(
-            visual_encoder,
-            num_landmark_points=num_landmark_points,
-            z_dim=512,
-        ).to(device)
+        visual_encoder = build_encoder(encoder_type).to(device)
+        if fusion_type == "concat":
+            encoder = VisualLandmarkEncoder(
+                visual_encoder,
+                num_landmark_points=num_landmark_points,
+                z_dim=512,
+            ).to(device)
+        elif fusion_type == "gated_residual":
+            encoder = VisualLandmarkEncoderGatedResidual(
+                visual_encoder,
+                num_landmark_points=num_landmark_points,
+                z_dim=512,
+            ).to(device)
+        elif fusion_type == "landmark_first":
+            encoder = VisualLandmarkEncoderLandmarkFirst(
+                visual_encoder,
+                num_landmark_points=num_landmark_points,
+                z_dim=512,
+            ).to(device)
+        else:
+            encoder = VisualLandmarkEncoderV2(
+                visual_encoder,
+                num_landmark_points=num_landmark_points,
+                z_dim=512,
+            ).to(device)
 
     base_decoder = build_base_decoder(
         decoder_type,
@@ -276,6 +280,9 @@ def create_dataset(args: argparse.Namespace, ckpt_config: dict):
 
     force_full_frame = config_value(args, ckpt_config, "force_full_frame", False)
     disable_fallback = config_value(args, ckpt_config, "disable_fallback", False)
+    encoder_type = args.encoder_type or ckpt_config.get("encoder_type", "non_snn")
+    use_optical_flow = bool(config_value(args, ckpt_config, "use_optical_flow", False) or is_flow_encoder_type(encoder_type))
+    flow_cache_dir = resolve_path(config_value(args, ckpt_config, "flow_cache_dir", "flow_cache"))
 
     dataset = VNLipDatasetV2(
         data_dir=str(data_dir),
@@ -287,6 +294,10 @@ def create_dataset(args: argparse.Namespace, ckpt_config: dict):
         dataset_output_dir=str(dataset_output_dir or PROJECT_ROOT / "Dataset_Output"),
         enable_fallback=not bool(disable_fallback),
         force_full_frame=bool(force_full_frame),
+        use_optical_flow=use_optical_flow,
+        flow_cache_dir=str(flow_cache_dir) if flow_cache_dir is not None else None,
+        flow_method=config_value(args, ckpt_config, "flow_method", "farneback"),
+        flow_scale=float(config_value(args, ckpt_config, "flow_scale", 10.0)),
     )
 
     if args.sample:
@@ -310,8 +321,14 @@ def infer_one(
     mouth_roi: list[int] | None = None,
 ):
     batch = collate_pad_v2([dataset[index]])
-    video, landmarks, target, lengths, paths = batch
+    flow = None
+    if len(batch) == 6:
+        video, flow, landmarks, target, lengths, paths = batch
+    else:
+        video, landmarks, target, lengths, paths = batch
     video = video.to(device)
+    if flow is not None:
+        flow = flow.to(device)
     landmarks = landmarks.to(device)
     target = target.to(device)
     lengths = lengths.to(device)
@@ -321,19 +338,22 @@ def infer_one(
         roi = mouth_roi or [45, 80, 32, 80]
         y1, y2, x1, x2 = roi
         video = video[:, :, :, y1:y2, x1:x2]
+        if flow is not None:
+            flow = flow[:, :, :, y1:y2, x1:x2]
+    video_input = (video, flow) if flow is not None else video
 
     encoder.eval()
     decoder.eval()
     reset_snn_if_needed(encoder, encoder_type)
     with torch.no_grad():
-        z = encoder(video, landmarks)
+        z = encoder(video_input, landmarks)
         pred = decoder(z, target_len=target.shape[1])
     reset_snn_if_needed(encoder, encoder_type)
 
     l1 = torch.nn.functional.l1_loss(pred.float(), target.float()).item()
     return {
         "path": paths[0],
-        "video": video,
+        "video": video_input,
         "landmarks": landmarks,
         "target": target,
         "lengths": lengths,
@@ -589,7 +609,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--max-frames", type=int, default=None, help="0 or negative means full sample.")
-    parser.add_argument("--encoder-type", default=None, choices=["non_snn", "nonsnn", "cnn_transformer", "snn"])
+    parser.add_argument("--encoder-type", default=None, choices=["non_snn", "nonsnn", "cnn_transformer", "snn", "ephrat_flow_r2plus1d", "flow_r2plus1d", "two_tower_flow"])
     parser.add_argument(
         "--decoder-type",
         default=None,
@@ -604,6 +624,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mouth-roi", type=int, nargs=4, default=[45, 80, 32, 80], metavar=("Y1", "Y2", "X1", "X2"), help="Mouth ROI [y1 y2 x1 x2].")
     parser.add_argument("--force-full-frame", default=None, action=argparse.BooleanOptionalAction)
     parser.add_argument("--disable-fallback", default=None, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--use-optical-flow", default=None, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--flow-cache-dir", default=None)
+    parser.add_argument("--flow-method", default=None, choices=["farneback", "pseudo"])
+    parser.add_argument("--flow-scale", type=float, default=None)
     parser.add_argument("--save-pt", action="store_true", help="Save predicted mel tensors as .pt files.")
     parser.add_argument("--save-wav", action="store_true", help="Pass mels through HiFi-GAN to synthesize reconstructed and ground-truth wav files.")
     parser.add_argument("--smoke-only", action="store_true", help="Run a quick dummy tensor smoke test.")

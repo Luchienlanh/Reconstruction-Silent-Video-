@@ -13,7 +13,13 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 from .snn import SpikingViTEncoder
-from .non_snn import NonSpikingViTEncoder
+from .non_snn import NonSpikingTemporalEncoder, NonSpikingVidResNet, NonSpikingViTEncoder
+
+FLOW_ENCODER_TYPES = {"ephrat_flow_r2plus1d", "flow_r2plus1d", "two_tower_flow"}
+
+
+def is_flow_encoder_type(encoder_type: str) -> bool:
+    return str(encoder_type).lower() in FLOW_ENCODER_TYPES
 
 def build_encoder(encoder_type="snn", **kwargs):
     encoder_type = encoder_type.lower()
@@ -21,6 +27,11 @@ def build_encoder(encoder_type="snn", **kwargs):
         return SpikingViTEncoder(**kwargs)
     if encoder_type in {"non_snn", "nonsnn", "cnn_transformer"}:
         return NonSpikingViTEncoder(**kwargs)
+    if is_flow_encoder_type(encoder_type):
+        num_landmark_points = kwargs.pop("num_landmark_points", kwargs.pop("num_points", None))
+        if num_landmark_points is None:
+            raise ValueError(f"{encoder_type} requires num_landmark_points")
+        return EphratFlowR2Plus1DEncoder(num_landmark_points=num_landmark_points, **kwargs)
     raise ValueError(f"Unknown ENCODER_TYPE: {encoder_type}")
 
 class LandmarkEncoder(nn.Module):
@@ -267,6 +278,143 @@ class LandmarkMotionEncoder(nn.Module):
             x = block(x)
         x = self.temporal(x)
         return self.output(x)
+
+
+class EphratFlowR2Plus1DEncoder(nn.Module):
+    """
+    Ephrat-style two-tower encoder with R(2+1)D backbones.
+
+    The RGB tower sees appearance, the flow tower sees explicit motion, and the
+    landmark tower keeps mouth geometry/dynamics as a stable residual cue.
+    Input video can be either:
+      - video tensor: (B, C, T, H, W), then a lightweight torch motion proxy is used;
+      - (video, flow) tuple, where flow is (B, 2, T, H, W).
+    Output: (B, T, 512).
+    """
+
+    def __init__(
+        self,
+        num_landmark_points: int,
+        z_dim: int = 512,
+        tower_layers: Optional[list[int]] = None,
+        temporal_blocks: int = 2,
+        n_heads: int = 8,
+        dropout: float = 0.05,
+        T_max: int = 1000,
+    ):
+        super().__init__()
+        layers = tower_layers or [1, 1, 1, 1]
+        self.rgb_tower = NonSpikingVidResNet(layers=layers, in_channels=1, spatial_pool_size=1)
+        self.flow_tower = NonSpikingVidResNet(layers=layers, in_channels=2, spatial_pool_size=1)
+        self.landmark_encoder = LandmarkMotionEncoder(
+            num_landmark_points,
+            hidden_dim=z_dim,
+            out_dim=z_dim,
+            dropout=dropout,
+        )
+        self.visual_encoder = nn.ModuleDict({"rgb": self.rgb_tower, "flow": self.flow_tower})
+
+        self.rgb_proj = nn.Linear(z_dim, z_dim)
+        self.flow_proj = nn.Linear(z_dim, z_dim)
+        self.landmark_proj = nn.Linear(z_dim, z_dim)
+        self.gate = nn.Sequential(
+            nn.Linear(z_dim * 3, z_dim),
+            nn.LayerNorm(z_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(z_dim, 2),
+        )
+        self.refine = nn.Sequential(
+            nn.LayerNorm(z_dim),
+            nn.Linear(z_dim, z_dim * 2),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(z_dim * 2, z_dim),
+        )
+        self.pos_embedding = nn.Parameter(torch.randn(1, T_max, z_dim) * 0.02)
+        self.temporal = NonSpikingTemporalEncoder(
+            z_dim=z_dim,
+            n_heads=n_heads,
+            n_blocks=temporal_blocks,
+            mlp_hidden_dim=z_dim * 4,
+            dropout=dropout,
+        )
+        self.norm = nn.LayerNorm(z_dim)
+
+        nn.init.constant_(self.gate[-1].bias, -1.0)
+
+    @staticmethod
+    def _align_time(x: torch.Tensor, target_t: int) -> torch.Tensor:
+        if x.shape[1] == target_t:
+            return x
+        return F.interpolate(
+            x.transpose(1, 2),
+            size=target_t,
+            mode="linear",
+            align_corners=False,
+        ).transpose(1, 2).contiguous()
+
+    @staticmethod
+    def _estimate_motion_flow(video: torch.Tensor) -> torch.Tensor:
+        gray = video.float().mean(dim=1, keepdim=True)
+        dt = gray[:, :, 1:] - gray[:, :, :-1]
+        dt = torch.cat([torch.zeros_like(dt[:, :, :1]), dt], dim=2)
+        gx = gray[:, :, :, :, 1:] - gray[:, :, :, :, :-1]
+        gx = F.pad(gx, (1, 0, 0, 0))
+        gy = gray[:, :, :, 1:, :] - gray[:, :, :, :-1, :]
+        gy = F.pad(gy, (0, 0, 1, 0))
+        return torch.cat([dt * gx, dt * gy], dim=1)
+
+    @staticmethod
+    def _split_video_flow(video):
+        if isinstance(video, (tuple, list)):
+            if len(video) != 2:
+                raise ValueError("Flow encoder expects video tuple/list as (frames, flow).")
+            return video[0], video[1]
+        return video, None
+
+    def _prepare_flow(self, video: torch.Tensor, flow: Optional[torch.Tensor]) -> torch.Tensor:
+        if flow is None:
+            flow = self._estimate_motion_flow(video)
+        flow = torch.nan_to_num(flow.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        if flow.dim() != 5:
+            raise ValueError(f"Flow must be 5D, got {tuple(flow.shape)}")
+        if flow.shape[1] != 2 and flow.shape[2] == 2:
+            flow = flow.transpose(1, 2).contiguous()
+        if flow.shape[1] != 2:
+            raise ValueError(f"Flow must have 2 channels, got {tuple(flow.shape)}")
+
+        target_size = (video.shape[2], video.shape[3], video.shape[4])
+        if tuple(flow.shape[2:]) != target_size:
+            flow = F.interpolate(flow, size=target_size, mode="trilinear", align_corners=False)
+        return flow
+
+    def forward(self, video, landmarks: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if landmarks is None:
+            raise ValueError("EphratFlowR2Plus1DEncoder requires landmarks.")
+
+        video, flow = self._split_video_flow(video)
+        video = torch.nan_to_num(video.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        flow = self._prepare_flow(video, flow)
+
+        z_rgb = self.rgb_tower(video)
+        z_flow = self.flow_tower(flow)
+        z_lm = self.landmark_encoder(landmarks)
+
+        target_t = z_lm.shape[1]
+        z_rgb = self._align_time(z_rgb, target_t)
+        z_flow = self._align_time(z_flow, target_t)
+
+        gate = torch.sigmoid(self.gate(torch.cat([z_rgb, z_flow, z_lm], dim=-1)))
+        z = self.rgb_proj(z_rgb)
+        z = z + gate[..., 0:1] * self.flow_proj(z_flow)
+        z = z + gate[..., 1:2] * self.landmark_proj(z_lm)
+        z = self.norm(z + self.refine(z))
+
+        if z.size(1) > self.pos_embedding.size(1):
+            raise ValueError(f"T={z.size(1)} exceeds T_max={self.pos_embedding.size(1)}")
+        z = z + self.pos_embedding[:, : z.size(1), :]
+        return self.norm(self.temporal(z))
 
 
 class VisualLandmarkEncoderV2(nn.Module):

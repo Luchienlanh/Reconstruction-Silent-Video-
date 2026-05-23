@@ -21,7 +21,7 @@ from typing import Optional
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 # Ensure parent and src directories are in sys.path to resolve modular imports
@@ -36,6 +36,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from data.dataset import VNLipDatasetV2, collate_pad_v2
 from models.encoders.factory import (
     build_encoder,
+    is_flow_encoder_type,
     VisualLandmarkEncoder,
     VisualLandmarkEncoderV2,
     VisualLandmarkEncoderGatedResidual,
@@ -116,7 +117,7 @@ def get_curriculum_frames(epoch: int, total_epochs: int, target_max_frames: int)
 
 
 def set_dataset_max_frames(dataset, max_frames: Optional[int]) -> None:
-    """Recursively unwrap Subsets to find the actual dataset and set max_frames."""
+    """Recursively unwrap dataset wrappers to find the actual dataset and set max_frames."""
     if hasattr(dataset, "dataset"):
         set_dataset_max_frames(dataset.dataset, max_frames)
     elif hasattr(dataset, "max_frames"):
@@ -179,31 +180,34 @@ def build_models(
     decoder_num_layers: int = 4,
     decoder_dropout: float = 0.0,
 ):
-    visual_encoder = build_encoder(encoder_type).to(device)
-    if fusion_type == "concat":
-        encoder = VisualLandmarkEncoder(
-            visual_encoder,
-            num_landmark_points=num_landmark_points,
-            z_dim=512,
-        ).to(device)
-    elif fusion_type == "gated_residual":
-        encoder = VisualLandmarkEncoderGatedResidual(
-            visual_encoder,
-            num_landmark_points=num_landmark_points,
-            z_dim=512,
-        ).to(device)
-    elif fusion_type == "landmark_first":
-        encoder = VisualLandmarkEncoderLandmarkFirst(
-            visual_encoder,
-            num_landmark_points=num_landmark_points,
-            z_dim=512,
-        ).to(device)
+    if is_flow_encoder_type(encoder_type):
+        encoder = build_encoder(encoder_type, num_landmark_points=num_landmark_points).to(device)
     else:
-        encoder = VisualLandmarkEncoderV2(
-            visual_encoder,
-            num_landmark_points=num_landmark_points,
-            z_dim=512,
-        ).to(device)
+        visual_encoder = build_encoder(encoder_type).to(device)
+        if fusion_type == "concat":
+            encoder = VisualLandmarkEncoder(
+                visual_encoder,
+                num_landmark_points=num_landmark_points,
+                z_dim=512,
+            ).to(device)
+        elif fusion_type == "gated_residual":
+            encoder = VisualLandmarkEncoderGatedResidual(
+                visual_encoder,
+                num_landmark_points=num_landmark_points,
+                z_dim=512,
+            ).to(device)
+        elif fusion_type == "landmark_first":
+            encoder = VisualLandmarkEncoderLandmarkFirst(
+                visual_encoder,
+                num_landmark_points=num_landmark_points,
+                z_dim=512,
+            ).to(device)
+        else:
+            encoder = VisualLandmarkEncoderV2(
+                visual_encoder,
+                num_landmark_points=num_landmark_points,
+                z_dim=512,
+            ).to(device)
 
     base_decoder = build_base_decoder(
         decoder_type,
@@ -267,7 +271,10 @@ def build_optimizer_groups(
 
 
 def unpack_batch(batch, device: torch.device, crop_mouth: bool = False, mouth_roi: list[int] = [45, 80, 32, 80]):
-    if len(batch) == 5:
+    flow = None
+    if len(batch) == 6:
+        video, flow, landmarks, target, lengths, paths = batch
+    elif len(batch) == 5:
         video, landmarks, target, lengths, paths = batch
     elif len(batch) == 4 and torch.is_tensor(batch[1]) and batch[1].dim() == 4:
         video, landmarks, target, lengths = batch
@@ -275,12 +282,18 @@ def unpack_batch(batch, device: torch.device, crop_mouth: bool = False, mouth_ro
     else:
         raise ValueError("Dataset batch shape is not recognized. Ensure VNLipDatasetV2 returns correct outputs.")
 
-    if crop_mouth:
+    if crop_mouth and video.dim() == 5:
         y1, y2, x1, x2 = mouth_roi
         video = video[:, :, :, y1:y2, x1:x2]
+        if flow is not None:
+            flow = flow[:, :, :, y1:y2, x1:x2]
+
+    video = video.to(device, non_blocking=True)
+    if flow is not None:
+        video = (video, flow.to(device, non_blocking=True))
 
     return (
-        video.to(device, non_blocking=True),
+        video,
         landmarks.to(device, non_blocking=True),
         target.to(device, non_blocking=True),
         lengths.to(device, non_blocking=True),
@@ -499,13 +512,82 @@ def evaluate(
     return total_loss / num_batches
 
 
+@torch.no_grad()
+def evaluate_mean_baseline(
+    loader: DataLoader,
+    criterion,
+    device: torch.device,
+    args: argparse.Namespace,
+    mel_mean: Optional[torch.Tensor],
+) -> Optional[float]:
+    if mel_mean is None:
+        return None
+
+    total_loss = 0.0
+    num_batches = 0
+    mean = mel_mean.to(device=device, dtype=torch.float32).view(1, 1, -1)
+    for batch in tqdm(loader, desc="mean-baseline", leave=False):
+        crop_mouth = getattr(args, "crop_mouth", False)
+        mouth_roi = getattr(args, "mouth_roi", [45, 80, 32, 80])
+        _, _, target, lengths, _ = unpack_batch(batch, device, crop_mouth=crop_mouth, mouth_roi=mouth_roi)
+        pred = mean.expand(target.shape[0], target.shape[1], -1).contiguous()
+        loss = criterion(pred.float(), target.float(), lengths)
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"Non-finite mean baseline loss: {float(loss.detach().cpu())}")
+        total_loss += float(loss.detach().cpu())
+        num_batches += 1
+
+    if num_batches == 0:
+        return None
+    return total_loss / num_batches
+
+
 def create_loaders(args: argparse.Namespace):
     data_dir = resolve_path(args.data_dir)
     dataset_output_dir = resolve_path(args.dataset_output_dir)
+    flow_cache_dir = resolve_path(args.flow_cache_dir) if getattr(args, "flow_cache_dir", None) else None
+    use_optical_flow = bool(getattr(args, "use_optical_flow", False) or is_flow_encoder_type(args.encoder_type))
     if data_dir is None or not data_dir.is_dir():
         raise FileNotFoundError(f"Data dir not found: {safe_text(data_dir)}")
 
-    dataset = VNLipDatasetV2(
+    base_dataset = VNLipDatasetV2(
+        data_dir=str(data_dir),
+        max_frames=args.max_frames,
+        random_crop=False,
+        return_path=True,
+        target_type="mel_hifigan",
+        use_landmarks=True,
+        dataset_output_dir=str(dataset_output_dir or PROJECT_ROOT / "Dataset_Output"),
+        enable_fallback=not args.disable_fallback,
+        force_full_frame=args.force_full_frame,
+        use_optical_flow=use_optical_flow,
+        flow_cache_dir=str(flow_cache_dir) if flow_cache_dir is not None else None,
+        flow_method=args.flow_method,
+        flow_scale=args.flow_scale,
+    )
+
+    files = list(base_dataset.files)
+    if args.limit is not None:
+        limit = max(1, min(int(args.limit), len(files)))
+        files = files[:limit]
+
+    total = len(files)
+    val_count = max(1, int(round(total * args.val_ratio))) if total > 1 else 0
+    train_count = total - val_count
+    if train_count <= 0:
+        raise RuntimeError("Dataset is too small for the requested validation split.")
+
+    rng = random.Random(args.seed)
+    shuffled_files = list(files)
+    rng.shuffle(shuffled_files)
+    if val_count > 0:
+        val_files = sorted(shuffled_files[:val_count])
+        train_files = sorted(shuffled_files[val_count:])
+    else:
+        train_files = sorted(shuffled_files)
+        val_files = []
+
+    train_set = VNLipDatasetV2(
         data_dir=str(data_dir),
         max_frames=args.max_frames,
         random_crop=True,
@@ -515,24 +597,31 @@ def create_loaders(args: argparse.Namespace):
         dataset_output_dir=str(dataset_output_dir or PROJECT_ROOT / "Dataset_Output"),
         enable_fallback=not args.disable_fallback,
         force_full_frame=args.force_full_frame,
+        use_optical_flow=use_optical_flow,
+        flow_cache_dir=str(flow_cache_dir) if flow_cache_dir is not None else None,
+        flow_method=args.flow_method,
+        flow_scale=args.flow_scale,
     )
+    train_set.files = train_files
 
-    split_dataset = dataset
-    if args.limit is not None:
-        limit = max(1, min(int(args.limit), len(dataset)))
-        split_dataset = Subset(dataset, list(range(limit)))
-
-    total = len(split_dataset)
-    val_count = max(1, int(round(total * args.val_ratio))) if total > 1 else 0
-    train_count = total - val_count
-    if train_count <= 0:
-        raise RuntimeError("Dataset is too small for the requested validation split.")
-
-    generator = torch.Generator().manual_seed(args.seed)
-    if val_count > 0:
-        train_set, val_set = random_split(split_dataset, [train_count, val_count], generator=generator)
-    else:
-        train_set, val_set = split_dataset, None
+    val_set = None
+    if val_files:
+        val_set = VNLipDatasetV2(
+            data_dir=str(data_dir),
+            max_frames=args.max_frames,
+            random_crop=False,
+            return_path=True,
+            target_type="mel_hifigan",
+            use_landmarks=True,
+            dataset_output_dir=str(dataset_output_dir or PROJECT_ROOT / "Dataset_Output"),
+            enable_fallback=not args.disable_fallback,
+            force_full_frame=args.force_full_frame,
+            use_optical_flow=use_optical_flow,
+            flow_cache_dir=str(flow_cache_dir) if flow_cache_dir is not None else None,
+            flow_method=args.flow_method,
+            flow_scale=args.flow_scale,
+        )
+        val_set.files = val_files
 
     train_loader = DataLoader(
         train_set,
@@ -553,10 +642,12 @@ def create_loaders(args: argparse.Namespace):
             collate_fn=collate_pad_v2,
         )
 
-    return dataset, train_loader, val_loader, train_count, val_count
+    return train_set, train_loader, val_loader, train_count, val_count
 
 
 def _target_from_dataset_item(item) -> torch.Tensor:
+    if len(item) >= 4 and torch.is_tensor(item[1]) and item[1].dim() == 4:
+        return item[3]
     if len(item) >= 3 and torch.is_tensor(item[1]) and item[1].dim() == 3:
         return item[2]
     if len(item) >= 2:
@@ -710,6 +801,10 @@ def run(args: argparse.Namespace) -> None:
                 "all" if args.mel_stats_max_samples <= 0 else args.mel_stats_max_samples,
             )
         )
+    if getattr(args, "use_optical_flow", False) or is_flow_encoder_type(args.encoder_type):
+        print(
+            f"[flow] enabled method={args.flow_method} cache={safe_text(resolve_path(args.flow_cache_dir)) if args.flow_cache_dir else 'none'}"
+        )
     print(
         f"[model] encoder={args.encoder_type} decoder={args.decoder_type} "
         f"hidden={args.decoder_hidden_dim} layers={args.decoder_num_layers} "
@@ -727,6 +822,12 @@ def run(args: argparse.Namespace) -> None:
         )
     )
     print(f"[optim] accum_steps={args.accum_steps} batch_size={args.batch_size} effective_batch_size={args.batch_size * args.accum_steps}")
+
+    mean_train_loss = evaluate_mean_baseline(train_loader, criterion, device, args, mel_mean)
+    mean_val_loss = evaluate_mean_baseline(val_loader, criterion, device, args, mel_mean) if val_loader is not None else None
+    if mean_train_loss is not None:
+        mean_val_text = "n/a" if mean_val_loss is None else f"{mean_val_loss:.6f}"
+        print(f"[baseline] mean_train={mean_train_loss:.6f} mean_val={mean_val_text}")
 
     target_max_frames = args.max_frames
 
@@ -828,7 +929,14 @@ def run(args: argparse.Namespace) -> None:
             torch.cuda.empty_cache()
         gc.collect()
 
-        row = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "best": best_val_loss}
+        row = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "best": best_val_loss,
+            "mean_train_loss": mean_train_loss,
+            "mean_val_loss": mean_val_loss,
+        }
         history.append(row)
         with open(output_dir / "history.json", "w", encoding="utf-8") as f:
             json.dump({"history": history, "config": vars(args)}, f, indent=2)
@@ -840,8 +948,11 @@ def run(args: argparse.Namespace) -> None:
         lr_text = ", ".join([f"{lr:.2e}" for lr in current_lrs])
 
         val_text = "n/a" if val_loss is None else f"{val_loss:.6f}"
+        gap_text = ""
+        if val_loss is not None and mean_val_loss is not None:
+            gap_text = f" gap_vs_mean={val_loss - mean_val_loss:+.6f}"
         mark = " best" if is_best else ""
-        print(f"[epoch {epoch:04d}] train={train_loss:.6f} val={val_text} best={best_val_loss:.6f}{mark} | lrs=[{lr_text}]")
+        print(f"[epoch {epoch:04d}] train={train_loss:.6f} val={val_text} best={best_val_loss:.6f}{gap_text}{mark} | lrs=[{lr_text}]")
 
     print(f"[done] output={safe_text(output_dir)}")
     print(f"[best] {safe_text(output_dir / 'best_model.pth')}")
@@ -853,7 +964,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-output-dir", default="Dataset_Output")
     parser.add_argument("--output-dir", default="checkpoints_modular")
     parser.add_argument("--resume", default=None)
-    parser.add_argument("--encoder-type", default="non_snn", choices=["non_snn", "nonsnn", "cnn_transformer", "snn"])
+    parser.add_argument("--encoder-type", default="non_snn", choices=["non_snn", "nonsnn", "cnn_transformer", "snn", "ephrat_flow_r2plus1d", "flow_r2plus1d", "two_tower_flow"])
     parser.add_argument(
         "--decoder-type",
         default="siren",
@@ -884,6 +995,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--accum-steps", type=int, default=1, help="Number of steps for gradient accumulation.")
     parser.add_argument("--force-full-frame", action="store_true")
     parser.add_argument("--disable-fallback", action="store_true")
+    parser.add_argument("--use-optical-flow", default=False, action=argparse.BooleanOptionalAction, help="Return dense optical flow from the dataset. Automatically enabled by flow encoders.")
+    parser.add_argument("--flow-cache-dir", default="flow_cache", help="Directory for cached optical-flow tensors.")
+    parser.add_argument("--flow-method", default="farneback", choices=["farneback", "pseudo"], help="Optical-flow backend. pseudo is a no-cv2 fallback.")
+    parser.add_argument("--flow-scale", type=float, default=10.0, help="Divide Farneback pixel displacement by this value before training.")
     parser.add_argument("--crop-mouth", action="store_true", help="Crop mouth region of interest from the input video.")
     parser.add_argument("--mouth-roi", type=int, nargs=4, default=[45, 80, 32, 80], help="Mouth ROI y1, y2, x1, x2")
     parser.add_argument("--fusion-type", default="landmark_first", choices=["concat", "cross_attn", "gated_residual", "landmark_first"], help="Landmark fusion type.")

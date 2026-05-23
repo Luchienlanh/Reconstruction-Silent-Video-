@@ -91,11 +91,12 @@ class NonSpikingBasicBlock(nn.Module):
 
 class NonSpikingVidResNet(nn.Module):
     def __init__(self, block=NonSpikingBasicBlock, conv_makers=[NonSpikingConv2DPlus1D] * 4,
-                 layers=[2, 2, 2, 2], zero_init_residual: bool=False, spatial_pool_size: int=1):
+                 layers=[2, 2, 2, 2], zero_init_residual: bool=False, spatial_pool_size: int=1,
+                 in_channels: int=1):
         super().__init__()
         self.in_channels = 64
         self.spatial_pool_size = spatial_pool_size
-        self.stem = NonSpikingDirectEncoder(in_channels=1, out_channels=64)
+        self.stem = NonSpikingDirectEncoder(in_channels=in_channels, out_channels=64)
         self.layer1 = self._make_layer(block, 64, conv_makers[0], layers[0], stride=1)
         self.layer2 = self._make_layer(block, 128, conv_makers[1], layers[1], stride=1)
         self.layer3 = self._make_layer(block, 256, conv_makers[2], layers[2], stride=1)
