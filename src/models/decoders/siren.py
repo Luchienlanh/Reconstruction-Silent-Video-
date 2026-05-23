@@ -47,7 +47,10 @@ class TFiLMSIRENDecoder(nn.Module):
             nn.init.kaiming_uniform_(self.param_net.weight)
             self.param_net.weight.data *= 0.01
             with torch.no_grad():
-                self.param_net.bias.data.uniform_(-1.0 / hidden_dim, 1.0 / hidden_dim)
+                self.param_net.bias.zero_()
+                for i in range(num_layers):
+                    start = i * 2 * hidden_dim
+                    self.param_net.bias[start + hidden_dim:start + 2 * hidden_dim].fill_(1.0)
         else:
             self.param_gru = nn.GRU(
                 condition_dim, condition_dim,
@@ -57,7 +60,11 @@ class TFiLMSIRENDecoder(nn.Module):
             # Init: Kaiming * 0.01 theo SIREN paper
             nn.init.kaiming_uniform_(self.param_proj.weight)
             self.param_proj.weight.data *= 0.01
-            self.param_proj.bias.data.uniform_(-1.0 / hidden_dim, 1.0 / hidden_dim)
+            with torch.no_grad():
+                self.param_proj.bias.zero_()
+                for i in range(num_layers):
+                    start = i * 2 * hidden_dim
+                    self.param_proj.bias[start + hidden_dim:start + 2 * hidden_dim].fill_(1.0)
             #     nn.Linear(condition_dim, condition_dim),
             #     nn.ReLU(),
             #     nn.Linear(condition_dim, total_params)
@@ -74,6 +81,10 @@ class TFiLMSIRENDecoder(nn.Module):
 
         self.input_constant = nn.Parameter(torch.randn(1, hidden_dim) * 0.1)
         self.condition_proj = nn.Linear(condition_dim, hidden_dim)
+        nn.init.xavier_uniform_(self.condition_proj.weight)
+        nn.init.zeros_(self.condition_proj.bias)
+        self.time_signal_scale = 0.1
+        self.condition_signal_scale = 1.0
 
         # Time positional encoding. This is important for mel output; otherwise the
         # decoder tends to learn only an average spectral envelope.
@@ -120,7 +131,12 @@ class TFiLMSIRENDecoder(nn.Module):
             pe = torch.nn.functional.pad(pe, (0, self.hidden_dim - pe.shape[-1]))
         pe = pe.to(dtype=Condition.dtype)
         time_signal = self.time_embed(pe)  # (B*T, hidden_dim)
-        X = X_base + time_signal  # Mỗi frame có input khác nhau
+        condition_signal = self.condition_proj(Condition.reshape(B * T, -1))
+        X = (
+            X_base
+            + self.time_signal_scale * time_signal
+            + self.condition_signal_scale * condition_signal
+        )
         gammas_flat = [g.reshape(B * T, -1) for g in gammas]
         betas_flat = [b.reshape(B * T, -1) for b in betas]
 
