@@ -190,7 +190,7 @@ class BYOLPredictor(nn.Module):
         return self.net(x)
 
 class BYOL(nn.Module):
-    def __init__(self, encoder, projection_dim=256, hidden_dim=4096, momentum=0.996):
+    def __init__(self, encoder, projection_dim=256, hidden_dim=4096, momentum=0.996, motion_weight=0.25):
         super().__init__()
         self.online_encoder = encoder
         self.target_encoder = copy.deepcopy(encoder)
@@ -198,6 +198,7 @@ class BYOL(nn.Module):
         self.target_projector = BYOLProjector(512, hidden_dim, projection_dim)
         self.predictor = BYOLPredictor(projection_dim, hidden_dim, projection_dim)
         self.momentum = momentum
+        self.motion_weight = motion_weight
 
         for p in self.target_encoder.parameters():
             p.requires_grad = False
@@ -216,23 +217,43 @@ class BYOL(nn.Module):
             for param_online in self.online_encoder.parameters():
                 param_online.requires_grad = True
 
+    @staticmethod
+    def _symmetric_cosine_loss(q1, q2, target1, target2):
+        return 2 - (
+            F.cosine_similarity(q1, target2.detach(), dim=-1).mean()
+            + F.cosine_similarity(q2, target1.detach(), dim=-1).mean()
+        )
+
+    @staticmethod
+    def _temporal_delta(x):
+        return x[:, 1:] - x[:, :-1]
+
     def forward(self, x1, x2):
-        z1 = self.online_encoder(x1).mean(dim=1)   # (B, 512)
-        z2 = self.online_encoder(x2).mean(dim=1)
+        # Keep the frame dimension so pretraining preserves lip-motion timing.
+        z1 = self.online_encoder(x1)   # (B, T, 512)
+        z2 = self.online_encoder(x2)   # (B, T, 512)
         p1 = self.online_projector(z1)
         p2 = self.online_projector(z2)
         q1 = self.predictor(p1)
         q2 = self.predictor(p2)
 
         with torch.no_grad():
-            t1 = self.target_encoder(x1).mean(dim=1)
-            t2 = self.target_encoder(x2).mean(dim=1)
-            tp1 = self.target_projector(t1)
-            tp2 = self.target_projector(t2)
+            t1 = self.target_encoder(x1)
+            t2 = self.target_encoder(x2)
+            target_p1 = self.target_projector(t1)
+            target_p2 = self.target_projector(t2)
 
-        loss = 2 - (F.cosine_similarity(q1, tp2, dim=-1).mean() +
-                    F.cosine_similarity(q2, tp1, dim=-1).mean())
-        return loss
+        frame_loss = self._symmetric_cosine_loss(q1, q2, target_p1, target_p2)
+
+        motion_loss = z1.new_tensor(0.0)
+        if self.motion_weight > 0 and z1.shape[1] > 1:
+            dz1 = self._temporal_delta(z1)
+            dz2 = self._temporal_delta(z2)
+            dt1 = self._temporal_delta(t1)
+            dt2 = self._temporal_delta(t2)
+            motion_loss = self._symmetric_cosine_loss(dz1, dz2, dt1, dt2)
+
+        return frame_loss + self.motion_weight * motion_loss
 
     @torch.no_grad()
     def update_target(self):
@@ -331,6 +352,7 @@ def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
                 'epoch': epoch,
                 'online_encoder_state_dict': raw_model.online_encoder.state_dict(),
                 'loss': avg_loss,
+                'motion_weight': raw_model.motion_weight,
                 'optimizer': optimizer.state_dict(),
             }
             torch.save(ckpt, os.path.join(checkpoint_dir, f"byol_epoch_{epoch}.pth"))
@@ -353,7 +375,8 @@ def train_byol(model, dataloader, optimizer, device, epochs, max_grad_norm=1.0,
                 except StopIteration:
                     pass
 
-    return model.online_encoder
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
+    return raw_model.online_encoder
 
 
 # ========== Main ==========
@@ -371,6 +394,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--momentum", type=float, default=0.996)
+    parser.add_argument("--motion-weight", type=float, default=0.25,
+                        help="Weight for temporal-delta consistency loss on encoder latents")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -456,7 +481,8 @@ def main():
     print(f"Base encoder: {args.encoder_type}")
 
     # 3. BYOL model
-    byol = BYOL(base_encoder, momentum=args.momentum).to(device)
+    byol = BYOL(base_encoder, momentum=args.momentum, motion_weight=args.motion_weight).to(device)
+    print(f"Motion consistency weight: {args.motion_weight}")
     if device.type == "cuda" and torch.cuda.device_count() > 1:
         print(f"[device] Found {torch.cuda.device_count()} GPUs. Wrapping BYOL in nn.DataParallel!")
         byol = nn.DataParallel(byol)

@@ -1,3 +1,16 @@
+__pycache__/
+*.py[cod]
+*.pth
+*.pt
+*.rar
+*.png
+checkpoints*/
+checkpoints_*/
+*_checkpoints/
+pretrained_models/
+FullFrame_test/
+Processed_Data_Mel_HiFiGAN/
+Processed_Data_Mel_HiFiGAN_FullFrame/
 Dataset_Output
 Document
 Paper reference
