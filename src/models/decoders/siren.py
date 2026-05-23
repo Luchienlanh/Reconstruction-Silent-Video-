@@ -35,7 +35,7 @@ class FiLMSIREN(nn.Module):
         return torch.sin(out)
 
 class TFiLMSIRENDecoder(nn.Module):
-    def __init__(self, condition_dim=512, hidden_dim=256, out_dim=640, num_layers=4, omega_zero=30.0, use_conv=False, output_activation="tanh"):
+    def __init__(self, condition_dim=512, hidden_dim=256, out_dim=640, num_layers=4, omega_zero=30.0, use_conv=False, output_activation="tanh", output_bias_init=-4.0):
         super().__init__()
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
@@ -77,7 +77,10 @@ class TFiLMSIRENDecoder(nn.Module):
         self.final_layer = nn.Linear(hidden_dim , out_dim)
         self.output_scale = nn.Parameter(torch.ones(1))  # learnable scale
         nn.init.xavier_uniform_(self.final_layer.weight)
-        nn.init.zeros_(self.final_layer.bias)
+        if self.output_activation in (None, "none", "linear"):
+            nn.init.constant_(self.final_layer.bias, output_bias_init)
+        else:
+            nn.init.zeros_(self.final_layer.bias)
 
         self.input_constant = nn.Parameter(torch.randn(1, hidden_dim) * 0.1)
         self.condition_proj = nn.Linear(condition_dim, hidden_dim)

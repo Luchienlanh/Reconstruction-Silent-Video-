@@ -18,12 +18,28 @@ except ImportError:
     pass
 
 class MelReconstructionLoss(nn.Module):
-    def __init__(self, lambda_mel=1.0, lambda_delta=0.25, lambda_delta2=0.05, lambda_energy=0.05):
+    def __init__(
+        self,
+        lambda_mel=1.0,
+        lambda_delta=0.25,
+        lambda_delta2=0.05,
+        lambda_energy=0.05,
+        mel_mean=None,
+        mel_std=None,
+    ):
         super().__init__()
         self.lambda_mel = lambda_mel
         self.lambda_delta = lambda_delta
         self.lambda_delta2 = lambda_delta2
         self.lambda_energy = lambda_energy
+        if mel_mean is not None and mel_std is not None:
+            mean = torch.as_tensor(mel_mean, dtype=torch.float32).view(1, 1, -1)
+            std = torch.as_tensor(mel_std, dtype=torch.float32).view(1, 1, -1).clamp_min(1e-4)
+            self.register_buffer("mel_mean", mean)
+            self.register_buffer("mel_std", std)
+        else:
+            self.mel_mean = None
+            self.mel_std = None
 
     def _mask(self, x, lengths):
         T = x.shape[1]
@@ -40,17 +56,24 @@ class MelReconstructionLoss(nn.Module):
     def _energy(self, mel):
         return torch.logsumexp(mel.float(), dim=-1, keepdim=True)
 
+    def _normalize_mel(self, mel):
+        if self.mel_mean is None or self.mel_std is None:
+            return mel
+        return (mel - self.mel_mean.to(device=mel.device, dtype=mel.dtype)) / self.mel_std.to(device=mel.device, dtype=mel.dtype)
+
     def forward(self, pred, target, lengths):
         pred = pred.float()
         target = target.float()
         lengths = lengths.to(device=pred.device, dtype=torch.long).clamp(min=1, max=pred.shape[1])
+        pred_norm = self._normalize_mel(pred)
+        target_norm = self._normalize_mel(target)
         loss = pred.new_tensor(0.0)
         if self.lambda_mel:
-            loss = loss + self.lambda_mel * self._masked_l1(pred, target, lengths)
+            loss = loss + self.lambda_mel * self._masked_l1(pred_norm, target_norm, lengths)
         if self.lambda_delta and pred.shape[1] > 1:
-            loss = loss + self.lambda_delta * self._masked_l1(self._delta(pred), self._delta(target), (lengths - 1).clamp_min(1))
+            loss = loss + self.lambda_delta * self._masked_l1(self._delta(pred_norm), self._delta(target_norm), (lengths - 1).clamp_min(1))
         if self.lambda_delta2 and pred.shape[1] > 2:
-            loss = loss + self.lambda_delta2 * self._masked_l1(self._delta(self._delta(pred)), self._delta(self._delta(target)), (lengths - 2).clamp_min(1))
+            loss = loss + self.lambda_delta2 * self._masked_l1(self._delta(self._delta(pred_norm)), self._delta(self._delta(target_norm)), (lengths - 2).clamp_min(1))
         if self.lambda_energy:
             loss = loss + self.lambda_energy * self._masked_l1(self._energy(pred), self._energy(target), lengths)
         if not torch.isfinite(loss):

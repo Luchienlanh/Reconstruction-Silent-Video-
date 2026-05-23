@@ -34,7 +34,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # Import modular components
 from data.dataset import VNLipDatasetV2, collate_pad_v2
-from models.encoders.factory import build_encoder, VisualLandmarkEncoder, VisualLandmarkEncoderV2, VisualLandmarkEncoderGatedResidual
+from models.encoders.factory import (
+    build_encoder,
+    VisualLandmarkEncoder,
+    VisualLandmarkEncoderV2,
+    VisualLandmarkEncoderGatedResidual,
+    VisualLandmarkEncoderLandmarkFirst,
+)
 from models.decoders.siren import TFiLMSIRENDecoder
 from models.decoders.direct_tcn import DirectTCNMelDecoder
 from models.decoders.wire import TFiLMWIREDecoder
@@ -52,7 +58,8 @@ def safe_text(value) -> str:
 def resolve_path(path: Optional[str]) -> Optional[Path]:
     if not path:
         return None
-    p = Path(path)
+    normalized = str(path).replace("\\", "/")
+    p = Path(normalized)
     if not p.is_absolute():
         p = PROJECT_ROOT / p
     return p
@@ -166,7 +173,7 @@ def build_models(
     encoder_type: str,
     decoder_type: str,
     num_landmark_points: int,
-    fusion_type: str = "cross_attn",
+    fusion_type: str = "landmark_first",
     target_type: str = "mel_hifigan",
     decoder_hidden_dim: int = 256,
     decoder_num_layers: int = 4,
@@ -181,6 +188,12 @@ def build_models(
         ).to(device)
     elif fusion_type == "gated_residual":
         encoder = VisualLandmarkEncoderGatedResidual(
+            visual_encoder,
+            num_landmark_points=num_landmark_points,
+            z_dim=512,
+        ).to(device)
+    elif fusion_type == "landmark_first":
+        encoder = VisualLandmarkEncoderLandmarkFirst(
             visual_encoder,
             num_landmark_points=num_landmark_points,
             z_dim=512,
@@ -208,44 +221,19 @@ def build_models(
     return encoder, decoder
 
 
-def load_compatible_state_dict(module: torch.nn.Module, state_dict: dict, tag: str):
-    target_state = module.state_dict()
-    compatible = {}
-    skipped = []
-    unexpected = []
-
-    for key, value in state_dict.items():
-        clean_key = key.removeprefix("module.")
-        if clean_key not in target_state:
-            unexpected.append(clean_key)
-            continue
-        if hasattr(value, "shape") and target_state[clean_key].shape != value.shape:
-            skipped.append((clean_key, tuple(value.shape), tuple(target_state[clean_key].shape)))
-            continue
-        compatible[clean_key] = value
-
-    missing_keys, unexpected_keys = module.load_state_dict(compatible, strict=False)
-    prefix = "[pretrained-ssl]"
-    print(
-        f"{prefix} {tag}: loaded={len(compatible)} "
-        f"missing={len(missing_keys)} unexpected={len(unexpected) + len(unexpected_keys)} skipped_shape={len(skipped)}"
-    )
-    if missing_keys:
-        print(f"{prefix} {tag} missing (first 8): {missing_keys[:8]}")
-    combined_unexpected = unexpected + list(unexpected_keys)
-    if combined_unexpected:
-        print(f"{prefix} {tag} unexpected (first 8): {combined_unexpected[:8]}")
-    if skipped:
-        formatted = [f"{k}: ckpt{src}->model{dst}" for k, src, dst in skipped[:8]]
-        print(f"{prefix} {tag} skipped shape mismatch (first 8): {formatted}")
-    return missing_keys, combined_unexpected, skipped
-
-def make_criterion(args: argparse.Namespace, device: torch.device):
+def make_criterion(
+    args: argparse.Namespace,
+    device: torch.device,
+    mel_mean: Optional[torch.Tensor] = None,
+    mel_std: Optional[torch.Tensor] = None,
+):
     return MelReconstructionLoss(
         lambda_mel=1.0,
         lambda_delta=args.lambda_delta,
         lambda_delta2=args.lambda_delta2,
         lambda_energy=args.lambda_energy,
+        mel_mean=mel_mean if getattr(args, "normalize_mel_loss", True) else None,
+        mel_std=mel_std if getattr(args, "normalize_mel_loss", True) else None,
     ).to(device)
 
 
@@ -568,6 +556,49 @@ def create_loaders(args: argparse.Namespace):
     return dataset, train_loader, val_loader, train_count, val_count
 
 
+def _target_from_dataset_item(item) -> torch.Tensor:
+    if len(item) >= 3 and torch.is_tensor(item[1]) and item[1].dim() == 3:
+        return item[2]
+    if len(item) >= 2:
+        return item[1]
+    raise ValueError("Dataset item does not contain a target tensor.")
+
+
+def compute_mel_stats(dataset, max_samples: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    limit = len(dataset) if max_samples <= 0 else min(len(dataset), int(max_samples))
+    if limit <= 0:
+        raise RuntimeError("Cannot compute mel stats from an empty dataset.")
+
+    total = None
+    total_sq = None
+    count = 0
+    for idx in tqdm(range(limit), desc="mel-stats", leave=False):
+        target = _target_from_dataset_item(dataset[idx]).float()
+        if target.dim() != 2:
+            raise ValueError(f"Expected mel target (T,80), got {tuple(target.shape)}")
+        total = target.sum(dim=0) if total is None else total + target.sum(dim=0)
+        total_sq = target.pow(2).sum(dim=0) if total_sq is None else total_sq + target.pow(2).sum(dim=0)
+        count += int(target.shape[0])
+
+    count = max(count, 1)
+    mean = total / count
+    var = (total_sq / count) - mean.pow(2)
+    std = var.clamp_min(1e-6).sqrt().clamp_min(0.05)
+    return mean.cpu(), std.cpu()
+
+
+def init_decoder_output_bias_from_mel_mean(decoder: torch.nn.Module, mel_mean: torch.Tensor) -> bool:
+    dec_module = unwrap_module(decoder)
+    base_decoder = getattr(dec_module, "base_decoder", dec_module)
+    for attr in ("output", "final_layer"):
+        layer = getattr(base_decoder, attr, None)
+        if isinstance(layer, torch.nn.Linear) and layer.bias is not None and layer.bias.numel() == mel_mean.numel():
+            with torch.no_grad():
+                layer.bias.copy_(mel_mean.to(device=layer.bias.device, dtype=layer.bias.dtype))
+            return True
+    return False
+
+
 def run(args: argparse.Namespace) -> None:
     seed_everything(args.seed)
     if args.device == "auto":
@@ -579,66 +610,40 @@ def run(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     dataset, train_loader, val_loader, train_count, val_count = create_loaders(args)
+    mel_mean = None
+    mel_std = None
+    if getattr(args, "normalize_mel_loss", True) or getattr(args, "init_decoder_bias_from_data", True):
+        mel_mean, mel_std = compute_mel_stats(
+            train_loader.dataset,
+            max_samples=max(0, int(getattr(args, "mel_stats_max_samples", 0))),
+        )
+        args.mel_loss_mean = [float(x) for x in mel_mean.tolist()]
+        args.mel_loss_std = [float(x) for x in mel_std.tolist()]
+
     encoder, decoder = build_models(
         device,
         args.encoder_type,
         args.decoder_type,
         dataset.landmark_num_points,
-        fusion_type=getattr(args, "fusion_type", "cross_attn"),
+        fusion_type=getattr(args, "fusion_type", "landmark_first"),
         target_type="mel_hifigan",
         decoder_hidden_dim=args.decoder_hidden_dim,
         decoder_num_layers=args.decoder_num_layers,
         decoder_dropout=args.decoder_dropout,
     )
-    
-    # Load Pre-trained SSL Weights if specified
-    if getattr(args, "pretrained_ssl", None) is not None:
-        pretrained_ssl_path = resolve_path(args.pretrained_ssl)
-        if pretrained_ssl_path and pretrained_ssl_path.is_file():
-            print(f"[pretrained-ssl] Loading weights from {safe_text(pretrained_ssl_path)}")
-            checkpoint = torch.load(pretrained_ssl_path, map_location=device, weights_only=False)
-            
-            if not hasattr(encoder, "visual_encoder"):
-                print("[pretrained-ssl] WARNING: Could not locate visual_encoder in encoder!")
-            elif isinstance(checkpoint, dict) and "online_encoder_state_dict" in checkpoint:
-                load_compatible_state_dict(
-                    encoder.visual_encoder,
-                    checkpoint["online_encoder_state_dict"],
-                    "visual_encoder from online_encoder_state_dict",
-                )
-            elif isinstance(checkpoint, dict) and "visual_encoder" in checkpoint:
-                load_compatible_state_dict(
-                    encoder.visual_encoder,
-                    checkpoint["visual_encoder"],
-                    "visual_encoder",
-                )
-            elif isinstance(checkpoint, dict) and "backbone" in checkpoint and checkpoint["backbone"] is not None:
-                load_compatible_state_dict(
-                    encoder.visual_encoder.backbone,
-                    checkpoint["backbone"],
-                    "visual_encoder.backbone",
-                )
-            elif isinstance(checkpoint, dict) and all(torch.is_tensor(value) for value in checkpoint.values()):
-                load_compatible_state_dict(
-                    encoder.visual_encoder,
-                    checkpoint,
-                    "visual_encoder from raw state_dict",
-                )
-            else:
-                print("[pretrained-ssl] WARNING: Unsupported SSL checkpoint format.")
-        else:
-            print(f"[pretrained-ssl] WARNING: Pretrained SSL path {args.pretrained_ssl} does not exist or is not a file!")
-
-    criterion = make_criterion(args, device)
+    if getattr(args, "init_decoder_bias_from_data", True) and mel_mean is not None:
+        bias_ok = init_decoder_output_bias_from_mel_mean(decoder, mel_mean)
+        print(f"[mel-stats] decoder_bias_from_data={'yes' if bias_ok else 'no'}")
+    criterion = make_criterion(args, device, mel_mean=mel_mean, mel_std=mel_std)
 
     if args.visual_lr_scale is None:
-        args.visual_lr_scale = 0.25 if args.pretrained_ssl else 1.0
+        args.visual_lr_scale = 1.0
     if args.fusion_lr_scale is None:
-        args.fusion_lr_scale = 1.0
+        args.fusion_lr_scale = 2.0
     if args.decoder_lr_scale is None:
         args.decoder_lr_scale = 5.0 if args.decoder_type.lower() == "direct_tcn" else (4.0 if args.decoder_type.lower() == "siren" else 1.0)
     if args.freeze_visual_epochs is None:
-        args.freeze_visual_epochs = 2 if args.pretrained_ssl else 0
+        args.freeze_visual_epochs = 0
 
     # Wrap model in nn.DataParallel to utilize all available GPUs
     if device.type == "cuda" and torch.cuda.device_count() > 1:
@@ -696,6 +701,15 @@ def run(args: argparse.Namespace) -> None:
         print(f"[device] Multi-GPU Active: {torch.cuda.device_count()}x GPUs utilized.")
     print(f"[data] {safe_text(resolve_path(args.data_dir))}")
     print(f"[split] train={train_count} val={val_count}")
+    if mel_mean is not None and mel_std is not None:
+        print(
+            "[mel-stats] normalize_loss={} mean_avg={:.4f} std_avg={:.4f} max_samples={}".format(
+                bool(getattr(args, "normalize_mel_loss", True)),
+                float(mel_mean.mean()),
+                float(mel_std.mean()),
+                "all" if args.mel_stats_max_samples <= 0 else args.mel_stats_max_samples,
+            )
+        )
     print(
         f"[model] encoder={args.encoder_type} decoder={args.decoder_type} "
         f"hidden={args.decoder_hidden_dim} layers={args.decoder_num_layers} "
@@ -722,7 +736,7 @@ def run(args: argparse.Namespace) -> None:
         args.freeze_visual_active = freeze_visual
         set_module_trainable(get_visual_encoder_module(encoder), not freeze_visual)
         if epoch == 1 and freeze_visual:
-            print("[freeze] visual_encoder frozen; training fusion/decoder against BYOL features first")
+            print("[freeze] visual_encoder frozen; training landmark/fusion/decoder first")
         elif epoch == args.freeze_visual_epochs + 1 and args.freeze_visual_epochs > 0:
             print("[freeze] visual_encoder unfrozen")
 
@@ -839,7 +853,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-output-dir", default="Dataset_Output")
     parser.add_argument("--output-dir", default="checkpoints_modular")
     parser.add_argument("--resume", default=None)
-    parser.add_argument("--encoder-type", default="non_snn", choices=["non_snn", "nonsnn", "cnn_transformer", "snn", "resnet18_temporal", "resnet2plus1d_spatial_motion"])
+    parser.add_argument("--encoder-type", default="non_snn", choices=["non_snn", "nonsnn", "cnn_transformer", "snn"])
     parser.add_argument(
         "--decoder-type",
         default="siren",
@@ -872,15 +886,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-fallback", action="store_true")
     parser.add_argument("--crop-mouth", action="store_true", help="Crop mouth region of interest from the input video.")
     parser.add_argument("--mouth-roi", type=int, nargs=4, default=[45, 80, 32, 80], help="Mouth ROI y1, y2, x1, x2")
-    parser.add_argument("--fusion-type", default="cross_attn", choices=["concat", "cross_attn", "gated_residual"], help="Landmark fusion type.")
+    parser.add_argument("--fusion-type", default="landmark_first", choices=["concat", "cross_attn", "gated_residual", "landmark_first"], help="Landmark fusion type.")
     parser.add_argument("--lr-scheduler", default="constant", choices=["constant", "onecycle", "cosine"], help="Learning rate scheduler type.")
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Number of warmup epochs for cosine scheduler.")
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning (progressive max_frames).")
-    parser.add_argument("--pretrained-ssl", default=None, help="Path to self-supervised pre-trained backbone checkpoint.")
-    parser.add_argument("--visual-lr-scale", type=float, default=None, help="Scale base LR for the visual encoder. Default: 0.25 with SSL, else 1.0.")
-    parser.add_argument("--fusion-lr-scale", type=float, default=None, help="Scale base LR for landmark/fusion layers. Default: 1.0.")
+    parser.add_argument("--visual-lr-scale", type=float, default=None, help="Scale base LR for the visual encoder. Default: 1.0.")
+    parser.add_argument("--fusion-lr-scale", type=float, default=None, help="Scale base LR for landmark/fusion layers. Default: 2.0.")
     parser.add_argument("--decoder-lr-scale", type=float, default=None, help="Scale base LR for decoder. Default: 5.0 for direct_tcn, 4.0 for siren, else 1.0.")
-    parser.add_argument("--freeze-visual-epochs", type=int, default=None, help="Freeze visual encoder for the first N epochs. Default: 2 with SSL, else 0.")
+    parser.add_argument("--freeze-visual-epochs", type=int, default=None, help="Freeze visual encoder for the first N epochs. Default: 0.")
+    parser.add_argument("--normalize-mel-loss", default=True, action=argparse.BooleanOptionalAction, help="Normalize mel/delta losses per mel bin using train-set stats.")
+    parser.add_argument("--init-decoder-bias-from-data", default=True, action=argparse.BooleanOptionalAction, help="Initialize decoder output bias with train-set mel mean.")
+    parser.add_argument("--mel-stats-max-samples", type=int, default=0, help="Max train samples for mel stats. 0 means all train samples.")
     return parser.parse_args()
 
 

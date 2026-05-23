@@ -42,7 +42,13 @@ from models.decoders.siren import TFiLMSIRENDecoder  # noqa: E402
 from models.decoders.upsample import MelTemporalUpsampleDecoder  # noqa: E402
 from models.decoders.wire import TFiLMWIREDecoder  # noqa: E402
 from models.decoders.wrap import TFiLMWrapFISINDecoder, TFiLMWrapFIWIDecoder  # noqa: E402
-from models.encoders.factory import VisualLandmarkEncoder, VisualLandmarkEncoderV2, VisualLandmarkEncoderGatedResidual, build_encoder  # noqa: E402
+from models.encoders.factory import (  # noqa: E402
+    VisualLandmarkEncoder,
+    VisualLandmarkEncoderV2,
+    VisualLandmarkEncoderGatedResidual,
+    VisualLandmarkEncoderLandmarkFirst,
+    build_encoder,
+)
 
 DEFAULT_HIFIGAN_SOURCE = "speechbrain/tts-hifigan-libritts-16kHz"
 DEFAULT_HIFIGAN_SAVEDIR = PROJECT_ROOT / "pretrained_models" / "tts-hifigan-libritts-16kHz"
@@ -118,7 +124,7 @@ def build_models(
     encoder_type: str,
     decoder_type: str,
     num_landmark_points: int,
-    fusion_type: str = "cross_attn",
+    fusion_type: str = "landmark_first",
     target_type: str = "mel_hifigan",
     decoder_hidden_dim: int = 256,
     decoder_num_layers: int = 4,
@@ -133,6 +139,12 @@ def build_models(
         ).to(device)
     elif fusion_type == "gated_residual":
         encoder = VisualLandmarkEncoderGatedResidual(
+            visual_encoder,
+            num_landmark_points=num_landmark_points,
+            z_dim=512,
+        ).to(device)
+    elif fusion_type == "landmark_first":
+        encoder = VisualLandmarkEncoderLandmarkFirst(
             visual_encoder,
             num_landmark_points=num_landmark_points,
             z_dim=512,
@@ -429,7 +441,7 @@ def run(args: argparse.Namespace) -> None:
     dataset, data_dir, max_frames = create_dataset(args, ckpt_config)
     encoder_type = args.encoder_type or ckpt_config.get("encoder_type", "non_snn")
     decoder_type = args.decoder_type or ckpt_config.get("decoder_type", "siren")
-    fusion_type = args.fusion_type or ckpt_config.get("fusion_type", "cross_attn")
+    fusion_type = args.fusion_type or ckpt_config.get("fusion_type", "landmark_first")
     default_decoder_hidden = 512 if decoder_type == "direct_tcn" else 256
     default_decoder_layers = 6 if decoder_type == "direct_tcn" else 4
     decoder_hidden_dim = config_value(args, ckpt_config, "decoder_hidden_dim", default_decoder_hidden)
@@ -577,7 +589,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--max-frames", type=int, default=None, help="0 or negative means full sample.")
-    parser.add_argument("--encoder-type", default=None, choices=["non_snn", "nonsnn", "cnn_transformer", "snn", "resnet18_temporal", "resnet2plus1d_spatial_motion"])
+    parser.add_argument("--encoder-type", default=None, choices=["non_snn", "nonsnn", "cnn_transformer", "snn"])
     parser.add_argument(
         "--decoder-type",
         default=None,
@@ -587,7 +599,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-num-layers", type=int, default=None)
     parser.add_argument("--decoder-dropout", type=float, default=None)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--fusion-type", default=None, choices=["concat", "cross_attn", "gated_residual"], help="Must match training config.")
+    parser.add_argument("--fusion-type", default=None, choices=["concat", "cross_attn", "gated_residual", "landmark_first"], help="Must match training config.")
     parser.add_argument("--crop-mouth", action="store_true", help="Crop mouth region from video frames (must match training).")
     parser.add_argument("--mouth-roi", type=int, nargs=4, default=[45, 80, 32, 80], metavar=("Y1", "Y2", "X1", "X2"), help="Mouth ROI [y1 y2 x1 x2].")
     parser.add_argument("--force-full-frame", default=None, action=argparse.BooleanOptionalAction)
