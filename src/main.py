@@ -639,9 +639,9 @@ def run(args: argparse.Namespace) -> None:
     if args.visual_lr_scale is None:
         args.visual_lr_scale = 1.0
     if args.fusion_lr_scale is None:
-        args.fusion_lr_scale = 2.0
+        args.fusion_lr_scale = 5.0
     if args.decoder_lr_scale is None:
-        args.decoder_lr_scale = 5.0 if args.decoder_type.lower() == "direct_tcn" else (4.0 if args.decoder_type.lower() == "siren" else 1.0)
+        args.decoder_lr_scale = 2.0 if args.decoder_type.lower() == "direct_tcn" else (3.0 if args.decoder_type.lower() == "siren" else 1.0)
     if args.freeze_visual_epochs is None:
         args.freeze_visual_epochs = 0
 
@@ -891,8 +891,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Number of warmup epochs for cosine scheduler.")
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning (progressive max_frames).")
     parser.add_argument("--visual-lr-scale", type=float, default=None, help="Scale base LR for the visual encoder. Default: 1.0.")
-    parser.add_argument("--fusion-lr-scale", type=float, default=None, help="Scale base LR for landmark/fusion layers. Default: 2.0.")
-    parser.add_argument("--decoder-lr-scale", type=float, default=None, help="Scale base LR for decoder. Default: 5.0 for direct_tcn, 4.0 for siren, else 1.0.")
+    parser.add_argument("--fusion-lr-scale", type=float, default=None, help="Scale base LR for landmark/fusion layers. Default: 5.0.")
+    parser.add_argument("--decoder-lr-scale", type=float, default=None, help="Scale base LR for decoder. Default: 2.0 for direct_tcn, 3.0 for siren, else 1.0.")
     parser.add_argument("--freeze-visual-epochs", type=int, default=None, help="Freeze visual encoder for the first N epochs. Default: 0.")
     parser.add_argument("--normalize-mel-loss", default=True, action=argparse.BooleanOptionalAction, help="Normalize mel/delta losses per mel bin using train-set stats.")
     parser.add_argument("--init-decoder-bias-from-data", default=True, action=argparse.BooleanOptionalAction, help="Initialize decoder output bias with train-set mel mean.")

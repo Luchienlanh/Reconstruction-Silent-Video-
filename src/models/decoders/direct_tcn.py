@@ -49,7 +49,6 @@ class DirectTCNMelDecoder(nn.Module):
         self.output_norm = nn.LayerNorm(hidden_dim)
         self.output = nn.Linear(hidden_dim, out_dim)
         nn.init.xavier_uniform_(self.output.weight)
-        self.output.weight.data *= 0.01
         nn.init.constant_(self.output.bias, output_bias_init)
 
     def forward(self, condition: torch.Tensor, target_len: Optional[int] = None) -> torch.Tensor:
