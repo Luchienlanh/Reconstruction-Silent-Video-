@@ -147,6 +147,8 @@ class CBHGLitePostnet(nn.Module):
         self.highways = nn.ModuleList([Highway(mel_dim) for _ in range(highway_layers)])
         self.gru = nn.GRU(mel_dim, channels // 2, num_layers=1, batch_first=True, bidirectional=True)
         self.out = nn.Linear(channels, mel_dim)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
 
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
         # mel: (B, T, 80)
@@ -164,7 +166,7 @@ class CBHGLitePostnet(nn.Module):
         for layer in self.highways:
             y = layer(y)
         y, _ = self.gru(y)
-        return self.out(y)
+        return mel + self.out(y)
 
 
 class Ephrat2017Model(nn.Module):
@@ -235,6 +237,40 @@ def masked_loss(pred: torch.Tensor, target: torch.Tensor, lengths: torch.Tensor,
     else:
         loss = (pred - target).abs() * mask
     return loss.sum() / mask.sum().clamp_min(1.0) / target.shape[-1]
+
+
+def target_from_dataset_index(dataset: VNLipDatasetV2, idx: int) -> torch.Tensor:
+    file_name = dataset.files[idx]
+    file_path = file_name if os.path.isabs(str(file_name)) else os.path.join(dataset.data_dir, file_name)
+    data = torch.load(file_path, map_location="cpu", weights_only=False)
+    target, _ = dataset._get_target(data, file_path)
+    return target.float()
+
+
+def compute_mel_mean(dataset: VNLipDatasetV2) -> torch.Tensor:
+    total = None
+    count = 0
+    for idx in tqdm(range(len(dataset)), desc="mel-mean", leave=False):
+        target = target_from_dataset_index(dataset, idx)
+        total = target.sum(dim=0) if total is None else total + target.sum(dim=0)
+        count += int(target.shape[0])
+    return (total / max(1, count)).cpu()
+
+
+@torch.no_grad()
+def mean_baseline_loss(loader, mel_mean: torch.Tensor, device: torch.device, args) -> Optional[float]:
+    if loader is None:
+        return None
+    mean = mel_mean.to(device=device, dtype=torch.float32).view(1, 1, -1)
+    total = 0.0
+    count = 0
+    for batch in tqdm(loader, desc="mean-baseline", leave=False):
+        _video, _flow, target, lengths, _ = unpack_batch(batch, device)
+        pred = mean.expand(target.shape[0], target.shape[1], -1).contiguous()
+        loss = (1.0 + args.postnet_weight) * masked_loss(pred, target.float(), lengths, args.loss)
+        total += float(loss.detach().cpu())
+        count += 1
+    return total / max(1, count)
 
 
 def unpack_batch(batch, device: torch.device):
@@ -389,7 +425,8 @@ def run(args) -> None:
 
     output_dir = resolve_path(args.output_dir) or PROJECT_ROOT / "checkpoints_ephrat2017"
     output_dir.mkdir(parents=True, exist_ok=True)
-    _, _, train_loader, val_loader = make_loaders(args)
+    train_ds, _val_ds, train_loader, val_loader = make_loaders(args)
+    mel_mean = compute_mel_mean(train_ds)
 
     model = Ephrat2017Model(
         clip_frames=args.clip_frames,
@@ -406,11 +443,15 @@ def run(args) -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and args.amp)
     best = float("inf")
     history = []
+    mean_train = mean_baseline_loss(train_loader, mel_mean, device, args)
+    mean_val = mean_baseline_loss(val_loader, mel_mean, device, args)
 
     print(f"[device] {device}")
     print(f"[data] {safe_text(resolve_path(args.data_dir))}")
     print(f"[model] ephrat2017 clip={args.clip_frames} mel_per_frame={args.mel_per_frame} width_scale={args.width_scale}")
     print(f"[flow] method={args.flow_method} cache={safe_text(resolve_path(args.flow_cache_dir)) if resolve_path(args.flow_cache_dir) else 'none'}")
+    mean_val_text = "n/a" if mean_val is None else f"{mean_val:.6f}"
+    print(f"[baseline] mean_train={mean_train:.6f} mean_val={mean_val_text}")
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, args)
@@ -422,13 +463,22 @@ def run(args) -> None:
             torch.save({"model_state_dict": state_dict(model), "config": vars(args), "epoch": epoch, "best": best}, output_dir / "best_model.pth")
         torch.save({"model_state_dict": state_dict(model), "config": vars(args), "epoch": epoch, "best": best}, output_dir / "last_model.pth")
 
-        row = {"epoch": epoch, "train": train_loss, "val": val_loss, "best": best}
+        row = {
+            "epoch": epoch,
+            "train": train_loss,
+            "val": val_loss,
+            "best": best,
+            "mean_train": mean_train,
+            "mean_val": mean_val,
+            "gap_vs_mean": (val_loss - mean_val) if val_loss is not None and mean_val is not None else None,
+        }
         history.append(row)
         with open(output_dir / "history.json", "w", encoding="utf-8") as f:
             json.dump({"history": history, "config": vars(args)}, f, indent=2)
         val_text = "n/a" if val_loss is None else f"{val_loss:.6f}"
+        gap = "" if row["gap_vs_mean"] is None else f" gap_vs_mean={row['gap_vs_mean']:+.6f}"
         mark = " best" if is_best else ""
-        print(f"[epoch {epoch:04d}] train={train_loss:.6f} val={val_text} best={best:.6f}{mark}")
+        print(f"[epoch {epoch:04d}] train={train_loss:.6f} val={val_text} best={best:.6f}{gap}{mark}")
 
     print(f"[done] {safe_text(output_dir)}")
 
