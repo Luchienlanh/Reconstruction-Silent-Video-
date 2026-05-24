@@ -250,6 +250,12 @@ def unpack_batch(batch, device: torch.device):
     )
 
 
+def forward_model(model: nn.Module, video: torch.Tensor, flow: torch.Tensor, target_len: int):
+    if isinstance(model, nn.DataParallel) and video.shape[0] < len(model.device_ids):
+        return model.module(video, flow, target_len=target_len)
+    return model(video, flow, target_len=target_len)
+
+
 def make_dataset(args, files: list[str], random_crop: bool) -> VNLipDatasetV2:
     data_dir = resolve_path(args.data_dir)
     dataset_output_dir = resolve_path(args.dataset_output_dir)
@@ -338,7 +344,7 @@ def evaluate(model, loader, device, args) -> Optional[float]:
     count = 0
     for batch in tqdm(loader, desc="val", leave=False):
         video, flow, target, lengths, _ = unpack_batch(batch, device)
-        mel, refined = model(video, flow, target_len=target.shape[1])
+        mel, refined = forward_model(model, video, flow, target_len=target.shape[1])
         loss = masked_loss(mel.float(), target.float(), lengths, args.loss)
         loss = loss + args.postnet_weight * masked_loss(refined.float(), target.float(), lengths, args.loss)
         total += float(loss.detach().cpu())
@@ -355,7 +361,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, args) -> float:
         video, flow, target, lengths, _ = unpack_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=amp_enabled):
-            mel, refined = model(video, flow, target_len=target.shape[1])
+            mel, refined = forward_model(model, video, flow, target_len=target.shape[1])
             loss = masked_loss(mel.float(), target.float(), lengths, args.loss)
             loss = loss + args.postnet_weight * masked_loss(refined.float(), target.float(), lengths, args.loss)
         if not torch.isfinite(loss):
