@@ -45,6 +45,7 @@ def make_loader(
     window_frames=30,
     hop_frames=10,
     max_windows_per_file=0,
+    cache_size=2,
 ):
     if windowed:
         ds = WindowedR2INRDataset(
@@ -53,6 +54,7 @@ def make_loader(
             window_frames=window_frames,
             hop_frames=hop_frames,
             max_windows_per_file=max_windows_per_file,
+            cache_size=cache_size,
             seed=seed,
         )
     else:
@@ -86,11 +88,13 @@ def model_inputs(batch: dict) -> dict:
 
 
 @torch.no_grad()
-def compute_mel_stats(loader: DataLoader, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def compute_mel_stats(loader: DataLoader, device: torch.device, max_batches: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
     total = None
     sq = None
     count = 0
-    for batch in tqdm(loader, desc="mel-stats", leave=False):
+    for batch_idx, batch in enumerate(tqdm(loader, desc="mel-stats", leave=False)):
+        if max_batches > 0 and batch_idx >= max_batches:
+            break
         mel = batch["mel"].to(device).float()
         mask = batch["mel_mask"].to(device).bool()
         vals = mel[mask]
@@ -108,10 +112,18 @@ def compute_mel_stats(loader: DataLoader, device: torch.device) -> tuple[torch.T
 
 
 @torch.no_grad()
-def mean_baseline(loader: DataLoader, criterion: MaskedMelLoss, mel_mean: torch.Tensor, device: torch.device) -> float:
+def mean_baseline(
+    loader: DataLoader,
+    criterion: MaskedMelLoss,
+    mel_mean: torch.Tensor,
+    device: torch.device,
+    max_batches: int = 0,
+) -> float:
     total = 0.0
     count = 0
-    for batch in tqdm(loader, desc="mean-baseline", leave=False):
+    for batch_idx, batch in enumerate(tqdm(loader, desc="mean-baseline", leave=False)):
+        if max_batches > 0 and batch_idx >= max_batches:
+            break
         batch = batch_to_device(batch, device)
         pred = mel_mean.to(device).view(1, 1, -1).expand_as(batch["mel"])
         loss = criterion(pred, batch["mel"], batch["mel_mask"])

@@ -128,14 +128,16 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, args, e
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, args, plot_path=None, epoch=0):
+def evaluate(model, loader, criterion, device, args, plot_path=None, epoch=0, max_batches=0):
     model.eval()
     criterion.set_shift_window(0)
     total = 0.0
     count = 0
     first_stats = None
     plotted = False
-    for batch in tqdm(loader, desc="val", leave=False):
+    for batch_idx, batch in enumerate(tqdm(loader, desc="val", leave=False)):
+        if max_batches > 0 and batch_idx >= max_batches:
+            break
         batch = batch_to_device(batch, device)
         batch = sanitize_batch(batch)
         pred = model(model_inputs(batch))
@@ -174,6 +176,7 @@ def run(args) -> None:
         window_frames=args.window_frames,
         hop_frames=args.hop_frames,
         max_windows_per_file=args.max_windows_per_file,
+        cache_size=args.dataset_cache_size,
     )
     val_loader = make_loader(
         args.data_dir,
@@ -188,6 +191,7 @@ def run(args) -> None:
         window_frames=args.window_frames,
         hop_frames=args.hop_frames,
         max_windows_per_file=args.val_max_windows_per_file or args.max_windows_per_file,
+        cache_size=args.dataset_cache_size,
     ) if val_files else None
     train_eval_loader = make_loader(
         args.data_dir,
@@ -202,6 +206,7 @@ def run(args) -> None:
         window_frames=args.window_frames,
         hop_frames=args.hop_frames,
         max_windows_per_file=args.val_max_windows_per_file or args.max_windows_per_file,
+        cache_size=args.dataset_cache_size,
     ) if args.eval_train_every > 0 else None
     stats_loader = make_loader(
         args.data_dir,
@@ -215,8 +220,9 @@ def run(args) -> None:
         window_frames=args.window_frames,
         hop_frames=args.hop_frames,
         max_windows_per_file=args.stats_max_windows_per_file or args.max_windows_per_file,
+        cache_size=args.dataset_cache_size,
     )
-    mel_mean, mel_std = compute_mel_stats(stats_loader, device)
+    mel_mean, mel_std = compute_mel_stats(stats_loader, device, max_batches=args.max_stats_batches)
     criterion = MaskedMelLoss(
         mel_mean,
         mel_std,
@@ -256,8 +262,14 @@ def run(args) -> None:
     )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and args.amp)
 
-    mean_train = mean_baseline(train_loader, criterion, mel_mean, device)
-    mean_val = mean_baseline(val_loader, criterion, mel_mean, device) if val_loader is not None else None
+    mean_train = mean_baseline(train_loader, criterion, mel_mean, device, max_batches=args.max_baseline_batches)
+    mean_val = mean_baseline(
+        val_loader,
+        criterion,
+        mel_mean,
+        device,
+        max_batches=args.max_baseline_batches,
+    ) if val_loader is not None else None
     print(f"[device] {device}")
     print(f"[data] train_files={len(train_files)} val_files={len(val_files)} train_items={len(train_loader.dataset)}")
     if args.windowed:
@@ -276,18 +288,32 @@ def run(args) -> None:
     for epoch in range(start_epoch, args.epochs + 1):
         train_metrics = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, args, epoch)
         train_loss = train_metrics["loss"]
+        should_eval_val = val_loader is not None and (
+            epoch == 1
+            or epoch == args.epochs
+            or args.eval_every <= 1
+            or epoch % args.eval_every == 0
+        )
         val_loss, stats = evaluate(
             model,
             val_loader,
             criterion,
             device,
             args,
-            plot_path=output_dir / f"mel_epoch_{epoch:04d}.png" if val_loader is not None and epoch % args.plot_every == 0 else None,
+            plot_path=output_dir / f"mel_epoch_{epoch:04d}.png" if should_eval_val and epoch % args.plot_every == 0 else None,
             epoch=epoch,
-        ) if val_loader is not None else (None, {})
+            max_batches=args.max_val_batches,
+        ) if should_eval_val else (None, {})
         train_eval_loss = None
         if train_eval_loader is not None and (epoch == 1 or epoch % args.eval_train_every == 0 or epoch == args.epochs):
-            train_eval_loss, _ = evaluate(model, train_eval_loader, criterion, device, args)
+            train_eval_loss, _ = evaluate(
+                model,
+                train_eval_loader,
+                criterion,
+                device,
+                args,
+                max_batches=args.max_train_eval_batches or args.max_val_batches,
+            )
         score = (train_eval_loss if train_eval_loss is not None else train_loss) if val_loss is None else val_loss
         is_best = score < best
         if is_best:
@@ -338,9 +364,15 @@ def parse_args():
     parser.add_argument("--windowed", default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument("--window-frames", type=int, default=30)
     parser.add_argument("--hop-frames", type=int, default=10)
-    parser.add_argument("--max-windows-per-file", type=int, default=0)
-    parser.add_argument("--val-max-windows-per-file", type=int, default=0)
+    parser.add_argument("--max-windows-per-file", type=int, default=12)
+    parser.add_argument("--val-max-windows-per-file", type=int, default=2)
     parser.add_argument("--stats-max-windows-per-file", type=int, default=6)
+    parser.add_argument("--dataset-cache-size", type=int, default=2)
+    parser.add_argument("--eval-every", type=int, default=3, help="Run validation every N epochs; epoch 1 and final epoch are always evaluated.")
+    parser.add_argument("--max-val-batches", type=int, default=160)
+    parser.add_argument("--max-train-eval-batches", type=int, default=0)
+    parser.add_argument("--max-stats-batches", type=int, default=256)
+    parser.add_argument("--max-baseline-batches", type=int, default=80)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--visual-lr-scale", type=float, default=0.5)
     parser.add_argument("--landmark-lr-scale", type=float, default=1.5)

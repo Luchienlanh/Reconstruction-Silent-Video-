@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import random
 from pathlib import Path
 from typing import Any
@@ -203,6 +204,7 @@ class WindowedR2INRDataset(Dataset):
         window_frames: int = 30,
         hop_frames: int = 10,
         max_windows_per_file: int = 0,
+        cache_size: int = 2,
         seed: int = 42,
         limit: int | None = None,
     ):
@@ -213,14 +215,30 @@ class WindowedR2INRDataset(Dataset):
         self.files = resolved
         self.window_frames = int(window_frames)
         self.hop_frames = int(hop_frames)
+        self.cache_size = max(0, int(cache_size))
+        self._cache: OrderedDict[Path, dict[str, Any]] = OrderedDict()
         self.seed = int(seed)
         self.index: list[tuple[int, int]] = []
         self._build_index(max_windows_per_file=max_windows_per_file)
 
+    def _get_item(self, path: Path) -> dict[str, Any]:
+        if self.cache_size <= 0:
+            return _load_cache(path)
+        item = self._cache.get(path)
+        if item is not None:
+            self._cache.move_to_end(path)
+            return item
+        item = _load_cache(path)
+        self._cache[path] = item
+        self._cache.move_to_end(path)
+        while len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False)
+        return item
+
     def _build_index(self, max_windows_per_file: int = 0) -> None:
         rng = random.Random(self.seed)
         for file_idx, path in enumerate(self.files):
-            item = _load_cache(path)
+            item = self._get_item(path)
             starts = window_starts(int(item["video_len"]), self.window_frames, self.hop_frames)
             if max_windows_per_file and len(starts) > max_windows_per_file:
                 rng.shuffle(starts)
@@ -235,7 +253,7 @@ class WindowedR2INRDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         file_idx, start = self.index[idx]
         path = self.files[file_idx]
-        item = _load_cache(path)
+        item = self._get_item(path)
         return extract_window(path, item, start, self.window_frames, clip_index=file_idx)
 
 
