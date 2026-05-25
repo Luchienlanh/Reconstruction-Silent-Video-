@@ -170,6 +170,10 @@ def run(args) -> None:
         num_workers=args.num_workers,
         shuffle=True,
         drop_last=args.drop_last,
+        windowed=args.windowed,
+        window_frames=args.window_frames,
+        hop_frames=args.hop_frames,
+        max_windows_per_file=args.max_windows_per_file,
     )
     val_loader = make_loader(
         args.data_dir,
@@ -180,6 +184,10 @@ def run(args) -> None:
         seed=args.seed,
         num_workers=args.num_workers,
         shuffle=False,
+        windowed=args.windowed,
+        window_frames=args.window_frames,
+        hop_frames=args.hop_frames,
+        max_windows_per_file=args.val_max_windows_per_file or args.max_windows_per_file,
     ) if val_files else None
     train_eval_loader = make_loader(
         args.data_dir,
@@ -190,6 +198,10 @@ def run(args) -> None:
         seed=args.seed,
         num_workers=args.num_workers,
         shuffle=False,
+        windowed=args.windowed,
+        window_frames=args.window_frames,
+        hop_frames=args.hop_frames,
+        max_windows_per_file=args.val_max_windows_per_file or args.max_windows_per_file,
     ) if args.eval_train_every > 0 else None
     stats_loader = make_loader(
         args.data_dir,
@@ -198,9 +210,25 @@ def run(args) -> None:
         max_frames=args.max_frames,
         random_crop=False,
         seed=args.seed,
+        num_workers=args.num_workers,
+        windowed=args.windowed,
+        window_frames=args.window_frames,
+        hop_frames=args.hop_frames,
+        max_windows_per_file=args.stats_max_windows_per_file or args.max_windows_per_file,
     )
     mel_mean, mel_std = compute_mel_stats(stats_loader, device)
-    criterion = MaskedMelLoss(mel_mean, mel_std).to(device)
+    criterion = MaskedMelLoss(
+        mel_mean,
+        mel_std,
+        lambda_mel=args.lambda_mel,
+        lambda_delta=args.lambda_delta,
+        lambda_delta2=args.lambda_delta2,
+        lambda_energy=args.lambda_energy,
+        lambda_band=args.lambda_band,
+        lambda_energy_delta=args.lambda_energy_delta,
+        lambda_variance=args.lambda_variance,
+        band_bins=args.band_bins,
+    ).to(device)
 
     model = build_model(device, args)
     configure_train_decoder(model, args)
@@ -231,8 +259,16 @@ def run(args) -> None:
     mean_train = mean_baseline(train_loader, criterion, mel_mean, device)
     mean_val = mean_baseline(val_loader, criterion, mel_mean, device) if val_loader is not None else None
     print(f"[device] {device}")
-    print(f"[data] train={len(train_files)} val={len(val_files)}")
+    print(f"[data] train_files={len(train_files)} val_files={len(val_files)} train_items={len(train_loader.dataset)}")
+    if args.windowed:
+        print(f"[window] frames={args.window_frames} hop={args.hop_frames} max_windows_per_file={args.max_windows_per_file}")
     print(f"[model] r2plus1d_inr dim={args.dim} spatial_tokens={args.spatial_tokens}")
+    print(
+        "[loss] "
+        f"mel={args.lambda_mel} band={args.lambda_band} delta={args.lambda_delta} "
+        f"delta2={args.lambda_delta2} energy={args.lambda_energy} "
+        f"energy_delta={args.lambda_energy_delta} variance={args.lambda_variance}"
+    )
     print(f"[baseline] mean_train={mean_train:.6f} mean_val={'n/a' if mean_val is None else f'{mean_val:.6f}'}")
 
     best = float("inf")
@@ -285,9 +321,9 @@ def run(args) -> None:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train srcV2 ResNet2+1D memory encoder + INR mel decoder.")
-    parser.add_argument("--data-dir", default="Processed_Data_R2INR")
-    parser.add_argument("--output-dir", default="checkpoints_r2inr_v2")
+    parser = argparse.ArgumentParser(description="Train improved srcV2 ResNet2+1D + lip-motion-aware mel decoder.")
+    parser.add_argument("--data-dir", default="../Processed_Data_R2INR_Frontal_v2")
+    parser.add_argument("--output-dir", default="checkpoints_r2inr_frontal_v2")
     parser.add_argument("--resume", default=None, help="Resume model weights from a srcV2 checkpoint. Optimizer is reset for staged training.")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--multi-gpu", default=True, action=argparse.BooleanOptionalAction)
@@ -299,6 +335,12 @@ def parse_args():
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--max-frames", type=int, default=125)
     parser.add_argument("--random-crop", default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--windowed", default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--window-frames", type=int, default=30)
+    parser.add_argument("--hop-frames", type=int, default=10)
+    parser.add_argument("--max-windows-per-file", type=int, default=0)
+    parser.add_argument("--val-max-windows-per-file", type=int, default=0)
+    parser.add_argument("--stats-max-windows-per-file", type=int, default=6)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--visual-lr-scale", type=float, default=0.5)
     parser.add_argument("--landmark-lr-scale", type=float, default=1.5)
@@ -309,7 +351,7 @@ def parse_args():
     parser.add_argument("--steps-per-batch", type=int, default=1, help="Repeat optimizer updates on each batch; useful for tiny limit-overfit tests.")
     parser.add_argument("--freeze-visual-epochs", type=int, default=0, help="Freeze only the visual R2+1D tower for the first N epochs.")
     parser.add_argument("--lambda-stats", type=float, default=0.0, help="Auxiliary loss weight for predicting per-clip normalized mel mean/std from encoder global token.")
-    parser.add_argument("--disable-time-direct", action="store_true", help="Disable sample-agnostic time->mel branch; useful for multi-sample conditioning tests.")
+    parser.add_argument("--disable-time-direct", default=True, action=argparse.BooleanOptionalAction, help="Disable sample-agnostic time->mel branch; default on so predictions must use lip motion.")
     parser.add_argument("--freeze-time-direct", action="store_true", help="Freeze time-direct branch parameters while keeping its configured scale.")
     parser.add_argument("--time-direct-scale", type=float, default=None)
     parser.add_argument("--time-conditioned-scale", type=float, default=None)
@@ -322,6 +364,14 @@ def parse_args():
     parser.add_argument("--spatial-tokens", type=int, default=4)
     parser.add_argument("--num-landmark-points", type=int, default=40)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--lambda-mel", type=float, default=0.50)
+    parser.add_argument("--lambda-delta", type=float, default=0.25)
+    parser.add_argument("--lambda-delta2", type=float, default=0.05)
+    parser.add_argument("--lambda-energy", type=float, default=0.05)
+    parser.add_argument("--lambda-band", type=float, default=0.35, help="Low-resolution spectral-envelope loss; less speaker/pitch-specific than full-bin L1.")
+    parser.add_argument("--lambda-energy-delta", type=float, default=0.15)
+    parser.add_argument("--lambda-variance", type=float, default=0.15, help="Penalize collapsed/flat mel dynamics by matching per-window normalized std.")
+    parser.add_argument("--band-bins", type=int, default=8)
     parser.add_argument("--shift-warmup", type=int, default=2)
     parser.add_argument("--shift-final", type=int, default=0)
     parser.add_argument("--shift-warmup-epochs", type=int, default=10)

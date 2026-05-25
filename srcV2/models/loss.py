@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class MaskedMelLoss(nn.Module):
@@ -13,6 +14,10 @@ class MaskedMelLoss(nn.Module):
         lambda_delta: float = 0.25,
         lambda_delta2: float = 0.05,
         lambda_energy: float = 0.05,
+        lambda_band: float = 0.25,
+        lambda_energy_delta: float = 0.10,
+        lambda_variance: float = 0.10,
+        band_bins: int = 8,
         shift_window: int = 0,
     ):
         super().__init__()
@@ -20,6 +25,10 @@ class MaskedMelLoss(nn.Module):
         self.lambda_delta = float(lambda_delta)
         self.lambda_delta2 = float(lambda_delta2)
         self.lambda_energy = float(lambda_energy)
+        self.lambda_band = float(lambda_band)
+        self.lambda_energy_delta = float(lambda_energy_delta)
+        self.lambda_variance = float(lambda_variance)
+        self.band_bins = int(band_bins)
         self.shift_window = int(shift_window)
         if mel_mean is not None and mel_std is not None:
             self.register_buffer("mel_mean", mel_mean.float().view(1, 1, -1))
@@ -69,9 +78,26 @@ class MaskedMelLoss(nn.Module):
     def _energy(x: torch.Tensor) -> torch.Tensor:
         return torch.logsumexp(x.float(), dim=-1, keepdim=True)
 
+    def _band_profile(self, x: torch.Tensor) -> torch.Tensor:
+        if self.band_bins <= 0 or x.shape[-1] <= self.band_bins:
+            return x
+        b, t, f = x.shape
+        y = x.reshape(b * t, 1, f)
+        y = F.adaptive_avg_pool1d(y, self.band_bins)
+        return y.reshape(b, t, self.band_bins)
+
+    @staticmethod
+    def _masked_mean_std(x: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mask_f = mask.to(x.device, dtype=x.dtype).unsqueeze(-1)
+        denom = mask_f.sum(dim=1).clamp_min(1.0)
+        mean = (x * mask_f).sum(dim=1) / denom
+        centered = (x - mean.unsqueeze(1)) * mask_f
+        std = (centered.pow(2).sum(dim=1) / denom).sqrt().clamp_min(1e-4)
+        return mean, std
+
     def forward(self, pred: torch.Tensor, target: torch.Tensor, mel_mask: torch.Tensor) -> torch.Tensor:
-        pred = pred.float()
-        target = target.float()
+        pred = torch.nan_to_num(pred.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+        target = torch.nan_to_num(target.float(), nan=0.0, posinf=20.0, neginf=-20.0)
         mel_mask = mel_mask.to(pred.device, dtype=torch.bool)
         pred_n = self._normalize(pred)
         target_n = self._normalize(target)
@@ -91,6 +117,24 @@ class MaskedMelLoss(nn.Module):
             )
         if self.lambda_energy:
             loss = loss + self.lambda_energy * self._masked_l1(self._energy(pred), self._energy(target), mel_mask)
+        if self.lambda_band:
+            pred_band = self._band_profile(pred_n)
+            target_band = self._band_profile(target_n)
+            loss = loss + self.lambda_band * self._shifted_l1(pred_band, target_band, mel_mask)
+        if self.lambda_energy_delta and pred.shape[1] > 1:
+            e_mask = mel_mask[:, 1:] & mel_mask[:, :-1]
+            loss = loss + self.lambda_energy_delta * self._masked_l1(
+                self._delta(self._energy(pred)),
+                self._delta(self._energy(target)),
+                e_mask,
+            )
+        if self.lambda_variance:
+            _, pred_std = self._masked_mean_std(pred_n, mel_mask)
+            _, target_std = self._masked_mean_std(target_n, mel_mask)
+            loss = loss + self.lambda_variance * F.smooth_l1_loss(
+                torch.log(pred_std),
+                torch.log(target_std.clamp_min(1e-4)),
+            )
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite mel loss: {float(loss.detach().cpu())}")
         return loss

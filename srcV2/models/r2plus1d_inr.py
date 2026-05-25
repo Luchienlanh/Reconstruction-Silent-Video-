@@ -185,6 +185,13 @@ class R2INRMemoryEncoder(nn.Module):
         super().__init__()
         self.visual = R2Plus1DVisualTower(dim=dim, spatial_tokens=spatial_tokens)
         self.landmarks = LandmarkMotionTower(num_points=num_points, dim=dim, dropout=dropout)
+        self.motion = nn.Sequential(
+            nn.Linear(8, dim),
+            nn.LayerNorm(dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, dim),
+        )
         self.time = TimeFourier(dim)
         self.fuse = nn.Sequential(
             nn.LayerNorm(dim),
@@ -202,7 +209,10 @@ class R2INRMemoryEncoder(nn.Module):
         video_mask = batch["video_mask"].bool()
 
         z_vis = self.visual(video)
-        z_lm = self.landmarks(landmarks, video_mask=video_mask).unsqueeze(2)
+        z_lm_base = self.landmarks(landmarks, video_mask=video_mask)
+        if "mouth_motion" in batch:
+            z_lm_base = z_lm_base + self.motion(batch["mouth_motion"].float())
+        z_lm = z_lm_base.unsqueeze(2)
         z = torch.cat([z_vis, z_lm], dim=2)
         b, t, k, d = z.shape
         time_emb = self.time(video_times).unsqueeze(2)
@@ -309,8 +319,8 @@ class INRMelDecoder(nn.Module):
             SineLayer(dim, dim),
             nn.Linear(dim, out_dim),
         )
-        self.time_direct_scale = nn.Parameter(torch.tensor(1.0))
-        self.time_conditioned_scale = nn.Parameter(torch.tensor(0.25))
+        self.time_direct_scale = nn.Parameter(torch.tensor(0.0))
+        self.time_conditioned_scale = nn.Parameter(torch.tensor(0.10))
         self.residual_scale = nn.Parameter(torch.tensor(0.05))
         nn.init.constant_(self.coarse[-1].bias, output_bias_init)
         nn.init.zeros_(self.time_direct[-1].bias)

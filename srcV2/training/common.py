@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from srcV2.data import R2INRDataset, collate_r2inr
+from srcV2.data import R2INRDataset, WindowedR2INRDataset, collate_r2inr
 from srcV2.models import MaskedMelLoss, R2INRModel
 from srcV2.utils.common import batch_to_device
 
@@ -41,8 +41,22 @@ def make_loader(
     num_workers=0,
     shuffle=False,
     drop_last=False,
+    windowed=False,
+    window_frames=30,
+    hop_frames=10,
+    max_windows_per_file=0,
 ):
-    ds = R2INRDataset(data_dir, files=files, max_frames=max_frames, random_crop=random_crop, seed=seed)
+    if windowed:
+        ds = WindowedR2INRDataset(
+            data_dir,
+            files=files,
+            window_frames=window_frames,
+            hop_frames=hop_frames,
+            max_windows_per_file=max_windows_per_file,
+            seed=seed,
+        )
+    else:
+        ds = R2INRDataset(data_dir, files=files, max_frames=max_frames, random_crop=random_crop, seed=seed)
     return DataLoader(
         ds,
         batch_size=batch_size,
@@ -64,6 +78,7 @@ def model_inputs(batch: dict) -> dict:
         "video_mask",
         "mel_mask",
         "mouth_valid_mask",
+        "mouth_motion",
         "video_lengths",
         "mel_lengths",
     )
@@ -79,9 +94,13 @@ def compute_mel_stats(loader: DataLoader, device: torch.device) -> tuple[torch.T
         mel = batch["mel"].to(device).float()
         mask = batch["mel_mask"].to(device).bool()
         vals = mel[mask]
+        if vals.numel() == 0:
+            continue
         total = vals.sum(dim=0) if total is None else total + vals.sum(dim=0)
         sq = vals.pow(2).sum(dim=0) if sq is None else sq + vals.pow(2).sum(dim=0)
         count += int(vals.shape[0])
+    if total is None or sq is None:
+        raise RuntimeError("Could not compute mel stats from an empty loader.")
     mean = total / max(1, count)
     var = (sq / max(1, count)) - mean.pow(2)
     std = var.clamp_min(1e-6).sqrt().clamp_min(0.05)
