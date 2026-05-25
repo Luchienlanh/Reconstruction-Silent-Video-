@@ -1,0 +1,298 @@
+PLAN KIEM TRA LOI THI GIAC VA KHOI PHUC AM THANH
+=================================================
+
+Muc tieu
+--------
+Model phai khoi phuc duoc audio co dao dong theo chuyen dong moi cua video. Output khong duoc chi la "am thanh trung binh" hoac mel gan voi mel_mean cua tap train.
+
+Ket qua test hien tai voi video.mp4
+-----------------------------------
+Input goc:
+- /home/long/Documents/Nhan_dang /Do_an/Trainning_server/video.mp4
+- video 112x112, 25 fps, thoi luong khoang 5.92s, co audio goc.
+
+Da tao input mat tieng:
+- /home/long/Documents/Nhan_dang /Do_an/Trainning_server/restored_video_test/video_muted.mp4
+
+Da sinh output:
+- /home/long/Documents/Nhan_dang /Do_an/Trainning_server/restored_video_test/video_muted_srcV2_pred_mel.pt
+- /home/long/Documents/Nhan_dang /Do_an/Trainning_server/restored_video_test/video_muted_srcV2_pred_mel.png
+- /home/long/Documents/Nhan_dang /Do_an/Trainning_server/restored_video_test/video_restored_speech.mp4
+
+Chan doan nhanh:
+- pred_mel shape: 370 x 80
+- pred std: 0.9428
+- target/audio-goc std: 1.5507
+- pred delta: 0.1062
+- target delta: 0.4789
+- delta_ratio_pred_target: 0.2218
+- normalized L1 pred_vs_mean: 0.2174
+- normalized L1 target_vs_mean: 3.6607
+- mean_collapse_score = pred_vs_mean / target_vs_mean: 0.0606
+
+Ket luan: output hien tai dang rat gan voi mel_mean. Day la loi "mean collapse" / "average sound" dung nhu loi cu. Model co tao dao dong nho nhung bien thien thoi gian thap hon target rat nhieu.
+
+Tinh trang thi giac tren video test:
+- MediaPipe detect duoc moi/face: valid_ratio = 1.0
+- video frame count: 148, fps = 25
+- landmark_d1_abs_mean = 0.00335
+- mouth_open_std_like = 0.0517
+
+Ket luan phu: pipeline detect landmark khong bi hong hoan toan. Nhung van co the co loi scale/crop/alignment/conditioning lam model khong dung thong tin thi giac du manh.
+
+
+Danh sach loi co the xay ra o phan thi giac
+-------------------------------------------
+
+1. Loi crop mieng khong dung vung moi
+- Crop qua rong, qua hep, lech len mui/cam, mat mot phan moi.
+- Box nhay theo frame lam model hoc chuyen dong gia.
+- Training dung crop 96x96 tu mieng, inference dung video full face hoac crop khac scale.
+- Video test 112x112 co the da la crop san, neu lai detect/crop lan nua thi mieng bi scale khac voi train.
+- Can test: luu grid crop moi inference, so sanh voi cache train.
+- Fix: them debug save crops, smooth crop box, dung cung mot preprocess cho train va inference, neu input la crop san thi cho phep --no-mediapipe hoac --input-is-mouth-crop.
+
+2. Loi landmark khong on dinh
+- MediaPipe detect dung ty le cao nhung toa do bi jitter.
+- Landmarks bi noi suy qua nhieu khi mat detection.
+- 40 diem moi chua du thong tin rang/luoi/ham.
+- Landmark d1/d2 qua nho sau normalize, model khong thay motion ro.
+- Can test: plot mouth_open, mouth_width, landmark speed theo frame.
+- Fix: smooth landmarks, them mouth aperture/speed/area vao input, chuan hoa scale theo mouth width thay vi full crop, tang trong so landmark branch.
+
+3. Loi mouth motion qua yeu
+- Nguoi noi it mo mieng, motion signal thap.
+- Dataset co nhieu frame doc tin tuc, moi chuyen dong nho, model hoc trung binh.
+- Video test co mouth motion khac distribution train.
+- Can test: correlation giua mouth_open/speed va target energy.
+- Fix: filter clip co motion thap, them curriculum tu clip mouth motion ro, them loss energy theo mouth_open.
+
+4. Loi temporal alignment video-audio
+- Audio va video bi lech 1-10 frame.
+- mel_times tinh sai do fps/hop_length.
+- Window lay t0/t1 chua khop voi center frame cua audio.
+- Random crop video nhung mel crop chua du chinh xac.
+- Inference 25 fps nhung train chu yeu 30 fps, time alignment khac.
+- Can test: quet shift tu -10 den +10 mel frames, tim shift co loss tot nhat.
+- Fix: shift-tolerant loss trong warmup, auto-sync bang AV offset, luu fps chuan va resample video ve fps train.
+
+5. Loi visual encoder khong hoc duoc
+- R2+1D visual tower qua nang so voi data/epoch, chua hoi tu.
+- Train moi 2 epoch nen model chua hoc visual conditioning.
+- Batch lon 30 + window it co the lam gradient trung binh hoa.
+- Visual branch lr thap hon decoder, decoder hoc mel_mean truoc.
+- Can test: zero_video/zero_landmarks/mismatch_sample ablation; neu loss khong tang, model bo qua visual.
+- Fix: pretrain landmark-only, tang landmark/visual lr, freeze decoder mean branch, train 30-80 epoch, them contrastive/mismatch loss.
+
+6. Loi fusion video-landmark
+- Fusion cong residual lam global token lan at temporal token.
+- Landmark token chi 1 token/frame, visual co nhieu token/frame, attention co the uu tien global/mean.
+- Global token dua vao decoder co the keo output ve average.
+- Can test: chay visual_only, landmark_only, gated fusion; do ablation delta.
+- Fix: landmark_first/gated fusion manh hon, bo hoac giam global_token trong decoder, them per-frame conditioning vao decoder.
+
+7. Loi decoder sinh theo time thay vi theo visual
+- time_direct/time_conditioned branch co the sinh mel mau chung theo thoi gian.
+- Neu branch time-only manh, output nghe nhu average prosody.
+- Can test: disable_time_direct, freeze time branch, zero visual/landmark xem output co doi khong.
+- Fix: disable time_direct mac dinh, phat loss neu zero/mismatch input cho output gan normal, tang dependence vao frame_memory.
+
+8. Loi window training/inference
+- Train window 30 frame, inference overlap-add nhung mel_idx co the lech.
+- Hann blend lam trung binh hoa qua nhieu giua window.
+- Window qua ngan khong du ngu canh am vi/phoneme.
+- Window qua dai lam model quay ve mean.
+- Can test: window_frames 30/45/60, hop 5/10/15, so sanh delta_ratio.
+- Fix: overlap-add dung mel_idx chinh xac, them context frame ngoai window, train multi-scale windows.
+
+9. Loi mask/padding
+- mel_mask/video_mask sai lam loss tinh ca padding zero.
+- mouth_valid_mask khong duoc dung trong model.
+- Padding video/landmark co gia tri zero lam model hoc silence/mean.
+- Can test: assert mask length, visualize valid frames, check loss chi tren mel_mask.
+- Fix: mask visual tokens, mask landmarks invalid, bo padded tokens khoi pooling/global.
+
+10. Loi normalization cua hinh anh
+- Train video grayscale 0..1 nhung inference BGR/gray resize khac.
+- Contrast/brightness cua video test khac train.
+- Compression artifact cua mp4 lam crop mo.
+- Can test: histogram pixel train vs inference.
+- Fix: histogram/CLAHE normalization, random brightness/contrast augmentation, resize/crop dung interpolation.
+
+11. Loi domain mismatch
+- Train tren VTV frontal news, test video khac camera/nguoi/ngon ngu/goc nhin.
+- Giong/ngu dieu test khac tap train, moi cung am nhung audio target khac.
+- Can test: chon sample trong validation cache va so voi video ngoai tap.
+- Fix: train nhieu speaker/domain hon, speaker/style embedding hoac canonical voice target.
+
+12. Loi data label/audio target
+- Audio co nhac nen/tieng moi truong/nguoi khac noi.
+- Audio khong dong bo voi mat dang noi.
+- Dataset co clip silent/low volume lam model hoc silence/mean.
+- Can test: filter energy, VAD, AV sync score.
+- Fix: loc clip bang VAD + face speaking score, bo clip co nhieu nguoi noi.
+
+
+Danh sach loi co the xay ra o loss/training lam nghe nhu am trung binh
+----------------------------------------------------------------------
+
+1. L1/MSE tren mel cua nhieu speaker
+- Cung mot chuyen dong moi co nhieu pitch/timbre hop le.
+- L1 se keo ve trung binh, nghe bi phang.
+- Fix: giam full-bin L1, tang spectral envelope/energy/delta/unit loss.
+
+2. Chua co semantic/phoneme supervision
+- Model khong biet noi am nao, chi doan pho thong ke.
+- Fix: them speech-unit loss tu HuBERT/wav2vec2/KMeans hoac lip-reading auxiliary target.
+
+3. Chua co speaker/canonical voice strategy
+- Neu muon mot giong chung, can target canonical voice hoac normalize pitch/speaker.
+- Neu khong, model bi keo ve mean giua nhieu giong.
+- Fix: train vocoder/canonical converter, speaker embedding, hoac unit-to-speech TTS voi mot voice chung.
+
+4. Train qua it epoch
+- Checkpoint hien tai config epochs=2.
+- Val loss tot hon mean baseline nhung pred van gan mean khi test video.
+- Fix: train it nhat 30-80 epoch, theo doi delta_ratio/energy_ratio chu khong chi loss.
+
+5. Batch/learning rate lam decoder hoc bias truoc
+- Bias init = mel_mean, neu visual signal yeu model o lai quanh mean.
+- Fix: warmup decoder nho, tang visual/landmark lr, them anti-collapse loss.
+
+6. Metric sai
+- Val loss thap khong dam bao audio nghe duoc.
+- Fix: log pred_vs_mean, delta_ratio, energy_ratio, ablation loss moi epoch.
+
+
+Danh sach loi co the xay ra o vocoder/khoi phuc audio
+-----------------------------------------------------
+
+1. Griffin-Lim fallback chat luong kem
+- Hien output wav duoc tao bang Griffin-Lim do may chua co HiFi-GAN/torchaudio/speechbrain/librosa.
+- Griffin-Lim tu mel du doan nghe se robotic/noisy, khong phai chat luong cuoi.
+- Fix: dung vocoder train dung mel format, vi du HiFi-GAN 16k.
+
+2. Mel scale khong khop vocoder
+- Model output log-mel cua torchaudio power=1. Vocoder co the can normalized log-mel khac.
+- Fix: chuan hoa mel theo dung vocoder, train/eval mel extractor duy nhat.
+
+3. Sample rate/hop_length sai
+- Train sr=16000, hop=256. Vocoder khac sr/hop se sai toc do/giong.
+- Fix: enforce sr/hop/n_mels trong checkpoint va inference.
+
+4. Pred mel gan mean thi vocoder nao cung nghe trung binh
+- Vocoder tot khong sua duoc loi conditioning.
+- Fix: sua model/loss/visual truoc, vocoder sau.
+
+5. Audio-video mux lech duration
+- Pred mel length khac video duration, audio bi cat/noi.
+- Fix: tinh mel_len tu video duration, pad/crop wav dung duration, mux -shortest.
+
+
+Test can lam de tim dung nguyen nhan
+------------------------------------
+
+1. Mean-collapse test
+- Tinh normalized L1(pred, mel_mean) va normalized L1(target, mel_mean).
+- Neu pred_vs_mean / target_vs_mean < 0.3 thi model collapse.
+- Hien tai score = 0.0606, rat xau.
+
+2. Delta/energy test
+- delta_ratio = mean_abs_delta(pred) / mean_abs_delta(target).
+- energy_ratio = std(logsumexp(pred)) / std(logsumexp(target)).
+- Muc tieu: delta_ratio > 0.6, energy_ratio > 0.6.
+- Hien tai delta_ratio = 0.2218.
+
+3. Visual ablation test
+- Normal input.
+- Zero video.
+- Zero landmarks.
+- Zero both.
+- Reverse time.
+- Mismatch sample.
+- Neu loss/pred khong doi nhieu thi model khong dung thi giac.
+
+4. Landmark quality test
+- valid_ratio phai cao.
+- mouth_open/speed phai co dao dong.
+- Neu valid_ratio cao ma model van collapse thi loi khong phai detect fail don gian.
+
+5. Alignment shift test
+- So sanh loss voi target shift -10..+10 mel frames.
+- Neu shift khac 0 tot hon nhieu thi can sua sync.
+
+6. Cache vs raw video test
+- Lay mot sample cache co target audio.
+- Chay inference tu cache va tu video raw/preprocessed.
+- Neu cache tot, raw video xau: loi inference preprocess.
+- Neu ca hai xau: loi model/training/loss.
+
+7. Train overfit test
+- Overfit 1 sample den loss rat thap va wav nghe duoc.
+- Neu khong overfit duoc: architecture/loss/preprocess co loi.
+- Neu overfit duoc ma full train collapse: loi one-to-many/data/loss.
+
+
+Ke hoach sua theo thu tu uu tien
+--------------------------------
+
+P0 - Xac nhan pipeline va ghi debug
+1. Luu crop moi inference thanh grid png.
+2. Luu mouth_open, mouth_width, speed, energy target/pred thanh plot.
+3. Them script diagnose cho checkpoint: normal/zero/reverse/mismatch.
+4. Log pred_vs_mean, delta_ratio, energy_ratio moi epoch.
+
+P1 - Chong collapse trong training
+1. Train lai it nhat 30 epoch, khong ket luan voi checkpoint 2 epoch.
+2. Tang anti-collapse loss:
+   - lambda_variance 0.2-0.4
+   - lambda_energy_delta 0.2
+   - lambda_delta 0.3
+3. Giam full mel L1 neu no keo ve mean:
+   - lambda_mel 0.25-0.5
+   - lambda_band 0.35-0.5
+4. Disable time_direct va phat mismatch:
+   - output normal phai khac output zero/mismatch.
+
+P2 - Tang su dung thi giac
+1. Landmark-first model hoac landmark-only pretrain.
+2. Tang landmark_lr_scale va visual_lr_scale.
+3. Bo/giam global_token trong decoder neu no keo ve mean.
+4. Them motion scalar vao decoder truc tiep, khong chi vao encoder.
+
+P3 - Sua sync va data
+1. Them shift search trong preprocessing de uoc luong A/V offset.
+2. Filter clip co VAD/speech-energy thap.
+3. Filter clip co mouth motion thap hoac face speaking score thap.
+4. Chuan hoa fps ve 25 hoac 30 dong nhat.
+
+P4 - Them semantic target
+1. Tao speech units tu audio bang HuBERT/wav2vec2/KMeans.
+2. Model predict mel + unit logits.
+3. Loss = mel envelope + energy + delta + unit CE.
+4. Sau do dung vocoder/unit-to-speech de tao voice chung.
+
+P5 - Vocoder
+1. Cai HiFi-GAN/SpeechBrain hoac vocoder hop voi mel format.
+2. Dam bao mel extractor train = mel extractor vocoder.
+3. Chi danh gia audio sau khi pred mel co delta_ratio/energy_ratio dat nguong.
+
+
+Lenh test da chay
+-----------------
+Tao video mat tieng:
+ffmpeg -y -i ../video.mp4 -an -c:v copy ../restored_video_test/video_muted.mp4
+
+Infer mel:
+python -m srcV2.infer_video --checkpoint ../trainning_output/best_model.pth --video ../restored_video_test/video_muted.mp4 --output-dir ../restored_video_test --device auto
+
+Mux video voi wav fallback:
+ffmpeg -y -i ../restored_video_test/video_muted.mp4 -i ../restored_video_test/video_muted_restored_griffinlim.wav -c:v copy -c:a aac -shortest ../restored_video_test/video_restored_speech.mp4
+
+
+Ket luan hanh dong tiep theo
+----------------------------
+1. Khong nen danh gia chat luong audio bang checkpoint 2 epoch.
+2. Can them diagnose ablation cho checkpoint hien tai de biet model co dung thi giac hay khong.
+3. Can train lai voi logging chong collapse va so epoch lon hon.
+4. Can vocoder dung mel format sau khi pred mel khong con gan mean.
