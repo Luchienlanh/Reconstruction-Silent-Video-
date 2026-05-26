@@ -71,6 +71,27 @@ def clone_batch(batch: dict) -> dict:
     return {key: value.clone() if torch.is_tensor(value) else deepcopy(value) for key, value in batch.items()}
 
 
+def slice_batch(batch: dict, size: int) -> dict:
+    if size <= 0:
+        return batch
+    batch_size = None
+    for value in batch.values():
+        if torch.is_tensor(value) and value.ndim > 0:
+            batch_size = int(value.shape[0])
+            break
+    if batch_size is None or size >= batch_size:
+        return batch
+    out = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.ndim > 0 and int(value.shape[0]) == batch_size:
+            out[key] = value[:size]
+        elif isinstance(value, list) and len(value) == batch_size:
+            out[key] = value[:size]
+        else:
+            out[key] = value
+    return out
+
+
 def zero_video_inputs(batch: dict) -> dict:
     out = clone_batch(batch)
     if "video" in out:
@@ -170,20 +191,40 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, args, e
                     stats_loss = torch.nn.functional.smooth_l1_loss(out["mel_stats"].float(), stats_target.float())
                     loss = loss + args.lambda_stats * stats_loss
                 if args.lambda_visual_mismatch > 0 and epoch >= args.visual_mismatch_start_epoch:
-                    bad_batch = mismatch_visual_inputs(train_batch)
+                    aux_train_batch = slice_batch(train_batch, args.visual_aux_batch_size)
+                    aux_target_batch = slice_batch(batch, args.visual_aux_batch_size)
+                    bad_batch = mismatch_visual_inputs(aux_train_batch)
                     if bad_batch is not None:
                         with torch.amp.autocast("cuda", enabled=amp_enabled):
                             pred_bad = model(model_inputs(bad_batch))
                         if torch.isfinite(pred_bad).all():
-                            bad_target_loss = criterion(pred_bad.float(), batch["mel"].float(), batch["mel_mask"])
-                            mismatch_loss = F.relu(args.visual_mismatch_margin + mel_loss.detach() - bad_target_loss)
+                            aux_n = int(pred_bad.shape[0])
+                            matched_aux_loss = criterion(
+                                pred[:aux_n].float(),
+                                aux_target_batch["mel"].float(),
+                                aux_target_batch["mel_mask"],
+                            ).detach()
+                            bad_target_loss = criterion(
+                                pred_bad.float(),
+                                aux_target_batch["mel"].float(),
+                                aux_target_batch["mel_mask"],
+                            )
+                            mismatch_loss = F.relu(args.visual_mismatch_margin + matched_aux_loss - bad_target_loss)
                             loss = loss + args.lambda_visual_mismatch * mismatch_loss
                 if args.lambda_visual_sensitivity > 0 and epoch >= args.visual_sensitivity_start_epoch:
-                    zero_batch = zero_visual_inputs(train_batch)
-                    with torch.amp.autocast("cuda", enabled=amp_enabled):
+                    aux_train_batch = slice_batch(train_batch, args.visual_aux_batch_size)
+                    aux_target_batch = slice_batch(batch, args.visual_aux_batch_size)
+                    zero_batch = zero_visual_inputs(aux_train_batch)
+                    with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
                         pred_zero = model(model_inputs(zero_batch))
                     if torch.isfinite(pred_zero).all():
-                        sensitivity = normalized_masked_l1(pred.float(), pred_zero.float().detach(), batch["mel_mask"], criterion)
+                        aux_n = int(pred_zero.shape[0])
+                        sensitivity = normalized_masked_l1(
+                            pred[:aux_n].float(),
+                            pred_zero.float(),
+                            aux_target_batch["mel_mask"],
+                            criterion,
+                        )
                         sensitivity_loss = F.relu(args.visual_sensitivity_margin - sensitivity)
                         loss = loss + args.lambda_visual_sensitivity * sensitivity_loss
                 if args.lambda_time_direct_scale > 0:
@@ -374,7 +415,7 @@ def run(args) -> None:
         "[visual-conditioning] "
         f"landmark_pretrain_epochs={args.landmark_pretrain_epochs} freeze_visual_epochs={args.freeze_visual_epochs} "
         f"freeze_decoder_bias_epochs={args.freeze_decoder_bias_epochs} mismatch={args.lambda_visual_mismatch} "
-        f"sensitivity={args.lambda_visual_sensitivity}"
+        f"sensitivity={args.lambda_visual_sensitivity} aux_batch={args.visual_aux_batch_size}"
     )
     print(
         "[lr-scale] "
@@ -515,6 +556,7 @@ def parse_args():
     parser.add_argument("--lambda-visual-sensitivity", type=float, default=0.05, help="Encourage predictions to change when all visual/landmark evidence is removed.")
     parser.add_argument("--visual-sensitivity-margin", type=float, default=0.05)
     parser.add_argument("--visual-sensitivity-start-epoch", type=int, default=1)
+    parser.add_argument("--visual-aux-batch-size", type=int, default=2, help="Run mismatch/sensitivity losses on this many samples to keep VRAM bounded.")
     parser.add_argument("--eval-train-every", type=int, default=0, help="Evaluate deterministic train-set loss every N epochs.")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--drop-last", default=False, action=argparse.BooleanOptionalAction)
