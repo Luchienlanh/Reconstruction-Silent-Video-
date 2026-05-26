@@ -102,11 +102,13 @@ def mean_baseline(loader: DataLoader, criterion: MaskedMelLoss, mel_mean: torch.
 
 
 def build_model(device: torch.device, args) -> R2INRModel:
+    upsample_mode = getattr(args, "upsample_mode", "conv_transpose")
     model = R2INRModel(
         dim=args.dim,
         spatial_tokens=args.spatial_tokens,
         num_points=args.num_landmark_points,
         dropout=args.dropout,
+        upsample_mode=upsample_mode,
     ).to(device)
     if device.type == "cuda" and torch.cuda.device_count() > 1 and getattr(args, "multi_gpu", True):
         print(f"[device] Found {torch.cuda.device_count()} GPUs. Using DataParallel.")

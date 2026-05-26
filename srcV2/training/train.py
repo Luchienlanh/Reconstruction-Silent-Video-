@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+# Ensure the parent directory of srcV2 is in sys.path
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 from tqdm.auto import tqdm
@@ -320,6 +327,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dim", type=int, default=512)
     parser.add_argument("--spatial-tokens", type=int, default=4)
+    parser.add_argument("--upsample-mode", default="conv_transpose", choices=["linear", "conv_transpose"], help="Upsampling mode from video-frame rate to mel-frame rate.")
     parser.add_argument("--num-landmark-points", type=int, default=40)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--shift-warmup", type=int, default=2)

@@ -261,8 +261,9 @@ class MelTemporalBlock(nn.Module):
 
 
 class INRMelDecoder(nn.Module):
-    def __init__(self, dim: int = 512, out_dim: int = 80, dropout: float = 0.0, output_bias_init: float = -4.0):
+    def __init__(self, dim: int = 512, out_dim: int = 80, dropout: float = 0.0, output_bias_init: float = -4.0, upsample_mode: str = "conv_transpose"):
         super().__init__()
+        self.upsample_mode = upsample_mode.lower()
         self.time = TimeFourier(dim, num_freqs=64, max_freq=96.0)
         self.query = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim))
         self.attn = nn.MultiheadAttention(dim, num_heads=8, dropout=dropout, batch_first=True)
@@ -271,6 +272,12 @@ class INRMelDecoder(nn.Module):
             nn.LayerNorm(dim),
             nn.Linear(dim, dim),
         )
+        if self.upsample_mode == "conv_transpose":
+            self.learned_upsample = nn.Sequential(
+                nn.ConvTranspose1d(dim, dim, kernel_size=4, stride=2, padding=1),
+                nn.SiLU(),
+                nn.Conv1d(dim, dim, kernel_size=3, padding=1),
+            )
         self.mel_refine = nn.ModuleList(
             [
                 MelTemporalBlock(dim, dilation=1, dropout=dropout),
@@ -310,8 +317,8 @@ class INRMelDecoder(nn.Module):
             nn.Linear(dim, out_dim),
         )
         self.time_direct_scale = nn.Parameter(torch.tensor(1.0))
-        self.time_conditioned_scale = nn.Parameter(torch.tensor(0.25))
-        self.residual_scale = nn.Parameter(torch.tensor(0.05))
+        self.time_conditioned_scale = nn.Parameter(torch.tensor(0.5))  # Increased for richer SIREN modulation
+        self.residual_scale = nn.Parameter(torch.tensor(0.2))  # Increased for stronger fine-grained reconstruction
         nn.init.constant_(self.coarse[-1].bias, output_bias_init)
         nn.init.zeros_(self.time_direct[-1].bias)
         nn.init.normal_(self.time_direct[-1].weight, 0.0, 1e-3)
@@ -320,11 +327,23 @@ class INRMelDecoder(nn.Module):
         nn.init.zeros_(self.residual[-1].bias)
         nn.init.normal_(self.residual[-1].weight, 0.0, 1e-3)
 
-    @staticmethod
-    def _align_frame_memory(encoded: dict[str, torch.Tensor], target_len: int) -> torch.Tensor:
+    def _align_frame_memory(self, encoded: dict[str, torch.Tensor], target_len: int) -> torch.Tensor:
         frame_memory = encoded["frame_memory"]
         if frame_memory.shape[1] == target_len:
             return frame_memory
+            
+        if getattr(self, "upsample_mode", "conv_transpose") == "conv_transpose":
+            x = frame_memory.transpose(1, 2)
+            x = self.learned_upsample(x)
+            if x.shape[2] != target_len:
+                x = F.interpolate(
+                    x,
+                    size=int(target_len),
+                    mode="linear",
+                    align_corners=False,
+                )
+            return x.transpose(1, 2).contiguous()
+            
         return F.interpolate(
             frame_memory.transpose(1, 2),
             size=int(target_len),
@@ -356,10 +375,10 @@ class INRMelDecoder(nn.Module):
 
 
 class R2INRModel(nn.Module):
-    def __init__(self, dim: int = 512, spatial_tokens: int = 4, num_points: int = 40, dropout: float = 0.0):
+    def __init__(self, dim: int = 512, spatial_tokens: int = 4, num_points: int = 40, dropout: float = 0.0, upsample_mode: str = "conv_transpose"):
         super().__init__()
         self.encoder = R2INRMemoryEncoder(dim=dim, spatial_tokens=spatial_tokens, num_points=num_points, dropout=dropout)
-        self.decoder = INRMelDecoder(dim=dim, out_dim=80, dropout=dropout)
+        self.decoder = INRMelDecoder(dim=dim, out_dim=80, dropout=dropout, upsample_mode=upsample_mode)
         self.mel_stats_head = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, dim),
