@@ -181,12 +181,20 @@ class LandmarkMotionTower(nn.Module):
 
 
 class R2INRMemoryEncoder(nn.Module):
-    def __init__(self, dim: int = 512, spatial_tokens: int = 4, num_points: int = 40, dropout: float = 0.0):
+    def __init__(
+        self,
+        dim: int = 512,
+        spatial_tokens: int = 4,
+        num_points: int = 40,
+        dropout: float = 0.0,
+        motion_dim: int = 19,
+    ):
         super().__init__()
         self.visual = R2Plus1DVisualTower(dim=dim, spatial_tokens=spatial_tokens)
         self.landmarks = LandmarkMotionTower(num_points=num_points, dim=dim, dropout=dropout)
+        self.motion_dim = int(motion_dim)
         self.motion = nn.Sequential(
-            nn.Linear(8, dim),
+            nn.Linear(self.motion_dim, dim),
             nn.LayerNorm(dim),
             nn.SiLU(),
             nn.Dropout(dropout),
@@ -211,7 +219,12 @@ class R2INRMemoryEncoder(nn.Module):
         z_vis = self.visual(video)
         z_lm_base = self.landmarks(landmarks, video_mask=video_mask)
         if "mouth_motion" in batch:
-            z_lm_base = z_lm_base + self.motion(batch["mouth_motion"].float())
+            motion = batch["mouth_motion"].float()
+            if motion.shape[-1] < self.motion_dim:
+                motion = F.pad(motion, (0, self.motion_dim - motion.shape[-1]))
+            elif motion.shape[-1] > self.motion_dim:
+                motion = motion[..., : self.motion_dim]
+            z_lm_base = z_lm_base + self.motion(motion)
         z_lm = z_lm_base.unsqueeze(2)
         z = torch.cat([z_vis, z_lm], dim=2)
         b, t, k, d = z.shape
@@ -366,9 +379,22 @@ class INRMelDecoder(nn.Module):
 
 
 class R2INRModel(nn.Module):
-    def __init__(self, dim: int = 512, spatial_tokens: int = 4, num_points: int = 40, dropout: float = 0.0):
+    def __init__(
+        self,
+        dim: int = 512,
+        spatial_tokens: int = 4,
+        num_points: int = 40,
+        dropout: float = 0.0,
+        motion_dim: int = 19,
+    ):
         super().__init__()
-        self.encoder = R2INRMemoryEncoder(dim=dim, spatial_tokens=spatial_tokens, num_points=num_points, dropout=dropout)
+        self.encoder = R2INRMemoryEncoder(
+            dim=dim,
+            spatial_tokens=spatial_tokens,
+            num_points=num_points,
+            dropout=dropout,
+            motion_dim=motion_dim,
+        )
         self.decoder = INRMelDecoder(dim=dim, out_dim=80, dropout=dropout)
         self.mel_stats_head = nn.Sequential(
             nn.LayerNorm(dim),

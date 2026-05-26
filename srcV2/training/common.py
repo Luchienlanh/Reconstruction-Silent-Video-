@@ -46,6 +46,7 @@ def make_loader(
     hop_frames=10,
     max_windows_per_file=0,
     cache_size=2,
+    audio_target_shift_frames=0,
 ):
     if windowed:
         ds = WindowedR2INRDataset(
@@ -56,9 +57,17 @@ def make_loader(
             max_windows_per_file=max_windows_per_file,
             cache_size=cache_size,
             seed=seed,
+            audio_target_shift_frames=audio_target_shift_frames,
         )
     else:
-        ds = R2INRDataset(data_dir, files=files, max_frames=max_frames, random_crop=random_crop, seed=seed)
+        ds = R2INRDataset(
+            data_dir,
+            files=files,
+            max_frames=max_frames,
+            random_crop=random_crop,
+            seed=seed,
+            audio_target_shift_frames=audio_target_shift_frames,
+        )
     return DataLoader(
         ds,
         batch_size=batch_size,
@@ -138,6 +147,7 @@ def build_model(device: torch.device, args) -> R2INRModel:
         spatial_tokens=args.spatial_tokens,
         num_points=args.num_landmark_points,
         dropout=args.dropout,
+        motion_dim=getattr(args, "motion_dim", 19),
     ).to(device)
     if device.type == "cuda" and torch.cuda.device_count() > 1 and getattr(args, "multi_gpu", True):
         print(f"[device] Found {torch.cuda.device_count()} GPUs. Using DataParallel.")
@@ -186,12 +196,22 @@ def save_checkpoint(path, model, optimizer, epoch, best, args, mel_mean, mel_std
 def load_checkpoint(path, model, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     target = unwrap_model(model)
-    missing, unexpected = target.load_state_dict(ckpt["model_state_dict"], strict=False)
-    print(f"[checkpoint] loaded={path} missing={len(missing)} unexpected={len(unexpected)}")
+    model_state = target.state_dict()
+    loadable = {}
+    skipped = []
+    for key, value in ckpt["model_state_dict"].items():
+        if key in model_state and tuple(model_state[key].shape) != tuple(value.shape):
+            skipped.append(key)
+            continue
+        loadable[key] = value
+    missing, unexpected = target.load_state_dict(loadable, strict=False)
+    print(f"[checkpoint] loaded={path} missing={len(missing)} unexpected={len(unexpected)} skipped_shape={len(skipped)}")
     if missing:
         print("[checkpoint] missing:", missing[:12])
     if unexpected:
         print("[checkpoint] unexpected:", unexpected[:12])
+    if skipped:
+        print("[checkpoint] skipped shape mismatch:", skipped[:12])
     return ckpt
 
 

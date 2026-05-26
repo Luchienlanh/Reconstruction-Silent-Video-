@@ -9,38 +9,22 @@ import torch
 import torch.nn.functional as F
 
 from srcV2.data.build_cache import LipLandmarkExtractor, decode_video_with_mouth_crops
-from srcV2.data.dataset import _load_cache, extract_window, window_starts
+from srcV2.data.dataset import _load_cache, _mouth_motion_features, extract_window, window_starts
 from srcV2.models import R2INRModel
 from srcV2.training.common import load_checkpoint, model_inputs
 from srcV2.utils.common import batch_to_device, get_device
 
 
-def _motion_features(landmarks: torch.Tensor) -> torch.Tensor:
-    xy = torch.nan_to_num(landmarks[..., :2].float(), nan=0.0, posinf=0.0, neginf=0.0)
-    min_xy = xy.amin(dim=1)
-    max_xy = xy.amax(dim=1)
-    width_height = max_xy - min_xy
-    center = xy.mean(dim=1)
-    d1 = torch.zeros_like(xy)
-    d2 = torch.zeros_like(xy)
-    if xy.shape[0] > 1:
-        d1[1:] = xy[1:] - xy[:-1]
-    if xy.shape[0] > 2:
-        d2[1:] = d1[1:] - d1[:-1]
-    speed = d1.norm(dim=-1).mean(dim=1, keepdim=True)
-    accel = d2.norm(dim=-1).mean(dim=1, keepdim=True)
-    mouth_open = xy[..., 1].std(dim=1, unbiased=False, keepdim=True)
-    area = width_height[:, :1] * width_height[:, 1:2]
-    return torch.cat([center, width_height, mouth_open, area, speed, accel], dim=-1)
-
-
 def load_config(ckpt: dict, args: argparse.Namespace) -> SimpleNamespace:
     cfg = ckpt.get("config") or {}
+    motion_weight = ckpt.get("model_state_dict", {}).get("encoder.motion.0.weight")
+    motion_dim = int(motion_weight.shape[1]) if torch.is_tensor(motion_weight) else int(cfg.get("motion_dim", 19))
     return SimpleNamespace(
         dim=int(cfg.get("dim", 512)),
         spatial_tokens=int(cfg.get("spatial_tokens", 4)),
         num_landmark_points=int(cfg.get("num_landmark_points", 40)),
         dropout=float(cfg.get("dropout", 0.0)),
+        motion_dim=motion_dim,
         multi_gpu=False,
     )
 
@@ -53,6 +37,7 @@ def load_model(checkpoint: Path, device: torch.device, args: argparse.Namespace)
         spatial_tokens=cfg.spatial_tokens,
         num_points=cfg.num_landmark_points,
         dropout=cfg.dropout,
+        motion_dim=cfg.motion_dim,
     ).to(device)
     load_checkpoint(checkpoint, model, device)
     model.eval()
@@ -102,7 +87,7 @@ def single_batch_from_window(win: dict) -> dict:
         "video_times": win["video_times"].unsqueeze(0),
         "mel_times": win["mel_times"].unsqueeze(0),
         "mouth_valid_mask": win["mouth_valid_mask"].unsqueeze(0),
-        "mouth_motion": win.get("mouth_motion", _motion_features(win["landmarks"])).unsqueeze(0),
+        "mouth_motion": win.get("mouth_motion", _mouth_motion_features(win["landmarks"])).unsqueeze(0),
         "video_mask": torch.ones(1, video_len, dtype=torch.bool),
         "mel_mask": torch.ones(1, mel_len, dtype=torch.bool),
         "video_lengths": torch.tensor([video_len], dtype=torch.long),

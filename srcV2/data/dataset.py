@@ -40,6 +40,7 @@ class R2INRDataset(Dataset):
         random_crop: bool = False,
         seed: int = 42,
         limit: int | None = None,
+        audio_target_shift_frames: int = 0,
     ):
         self.data_dir = Path(data_dir)
         files = _resolve_files(self.data_dir, files)
@@ -49,6 +50,7 @@ class R2INRDataset(Dataset):
         self.max_frames = int(max_frames)
         self.random_crop = bool(random_crop)
         self.rng = random.Random(seed)
+        self.audio_target_shift_frames = int(audio_target_shift_frames)
 
     def __len__(self) -> int:
         return len(self.files)
@@ -65,10 +67,12 @@ class R2INRDataset(Dataset):
         t0 = float(item["video_times"][start])
         t1 = float(item["video_times"][end - 1])
         mel_times = item["mel_times"]
-        mel_mask = (mel_times >= t0) & (mel_times <= t1)
-        if not bool(mel_mask.any()):
+        mel_idx = torch.nonzero((mel_times >= t0) & (mel_times <= t1), as_tuple=False).flatten()
+        if mel_idx.numel() <= 0:
             approx = round(self.max_frames * item["sample_rate"] / max(1.0, item["fps"] * item["hop_length"]))
-            mel_mask = torch.arange(mel_times.numel()) < max(1, approx)
+            mel_idx = torch.arange(mel_times.numel()) < max(1, approx)
+            mel_idx = torch.nonzero(mel_idx, as_tuple=False).flatten()
+        mel_idx, target_idx = _target_mel_indices(mel_idx, int(item["mel_len"]), self.audio_target_shift_frames)
 
         item = dict(item)
         item["video"] = item["video"][:, start:end]
@@ -76,15 +80,26 @@ class R2INRDataset(Dataset):
         item["video_times"] = item["video_times"][start:end]
         item["mouth_valid_mask"] = item["mouth_valid_mask"][start:end]
         item["crop_boxes"] = item["crop_boxes"][start:end]
-        item["mel"] = item["mel"][mel_mask]
-        item["mel_times"] = item["mel_times"][mel_mask]
+        item["mel"] = item["mel"][target_idx]
+        item["mel_times"] = item["mel_times"][mel_idx]
         item["video_len"] = int(item["video"].shape[1])
         item["mel_len"] = int(item["mel"].shape[0])
+        item["_audio_target_shift_applied"] = True
         return item
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         path = self.files[idx]
         item = self._crop(_load_cache(path))
+        if self.audio_target_shift_frames and not item.get("_audio_target_shift_applied"):
+            mel_idx = torch.arange(int(item["mel_len"]), dtype=torch.long)
+            mel_idx, target_idx = _target_mel_indices(mel_idx, int(item["mel_len"]), self.audio_target_shift_frames)
+            item = dict(item)
+            item["mel"] = item["mel"][target_idx]
+            item["mel_times"] = item["mel_times"][mel_idx]
+            item["mel_len"] = int(item["mel"].shape[0])
+        crop_boxes = item.get("crop_boxes")
+        if torch.is_tensor(crop_boxes):
+            crop_boxes = crop_boxes.float()
         return {
             "video": item["video"].float(),
             "landmarks": item["landmarks"].float(),
@@ -92,6 +107,7 @@ class R2INRDataset(Dataset):
             "video_times": item["video_times"].float(),
             "mel_times": item["mel_times"].float(),
             "mouth_valid_mask": item["mouth_valid_mask"].bool(),
+            "mouth_motion": _mouth_motion_features(item["landmarks"].float(), crop_boxes),
             "video_len": int(item["video_len"]),
             "mel_len": int(item["mel_len"]),
             "path": str(path),
@@ -145,23 +161,90 @@ def mel_indices_for_video_window(item: dict[str, Any], start: int, end: int) -> 
     return torch.arange(mel_start, mel_end, dtype=torch.long)
 
 
-def _mouth_motion_features(landmarks: torch.Tensor) -> torch.Tensor:
-    xy = torch.nan_to_num(landmarks[..., :2].float(), nan=0.0, posinf=0.0, neginf=0.0)
-    min_xy = xy.amin(dim=1)
-    max_xy = xy.amax(dim=1)
-    width_height = max_xy - min_xy
-    center = xy.mean(dim=1)
+def _target_mel_indices(mel_idx: torch.Tensor, mel_len: int, audio_target_shift_frames: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    mel_idx = mel_idx.long()
+    shift = int(audio_target_shift_frames)
+    if mel_idx.numel() == 0 or shift == 0:
+        return mel_idx, mel_idx
+    target_idx = mel_idx + shift
+    valid = (target_idx >= 0) & (target_idx < int(mel_len))
+    if bool(valid.any()):
+        return mel_idx[valid], target_idx[valid]
+    return mel_idx, target_idx.clamp(0, max(0, int(mel_len) - 1))
+
+
+def _smooth_xy(xy: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
+    if xy.shape[0] < 3:
+        return xy
+    k = min(int(kernel_size), int(xy.shape[0]))
+    if k % 2 == 0:
+        k -= 1
+    if k < 3:
+        return xy
+    flat = xy.flatten(1).transpose(0, 1).unsqueeze(0)
+    flat = F.pad(flat, (k // 2, k // 2), mode="replicate")
+    flat = F.avg_pool1d(flat, kernel_size=k, stride=1)
+    return flat.squeeze(0).transpose(0, 1).reshape_as(xy)
+
+
+def _derivatives(xy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     d1 = torch.zeros_like(xy)
     d2 = torch.zeros_like(xy)
     if xy.shape[0] > 1:
         d1[1:] = xy[1:] - xy[:-1]
     if xy.shape[0] > 2:
         d2[1:] = d1[1:] - d1[:-1]
+    return d1, d2
+
+
+def _box_motion_features(crop_boxes: torch.Tensor | None, width_height: torch.Tensor) -> torch.Tensor:
+    t = int(width_height.shape[0])
+    if crop_boxes is None or not torch.is_tensor(crop_boxes) or crop_boxes.numel() == 0:
+        return width_height.new_zeros(t, 9)
+
+    boxes = torch.nan_to_num(crop_boxes.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    if boxes.shape[0] != t:
+        boxes = boxes[:t] if boxes.shape[0] > t else F.pad(boxes, (0, 0, 0, t - boxes.shape[0]))
+    if boxes.shape[-1] < 3:
+        return width_height.new_zeros(t, 9)
+
+    side = boxes[:, 2:3].clamp_min(1e-4)
+    center = boxes[:, :2] + side * 0.5
+    side_ref = side.median().clamp_min(1.0)
+    center_ref = center.mean(dim=0, keepdim=True)
+    center_rel = (center - center_ref) / side_ref
+    side_rel = side / side_ref
+    side_abs = torch.log1p(side) / 5.0
+    raw_width = width_height[:, :1] * side_rel
+    raw_height = width_height[:, 1:2] * side_rel
+    raw_area = raw_width * raw_height
+    raw_open_ratio = raw_height / raw_width.clamp_min(1e-4)
+
+    center_d1, _ = _derivatives(center_rel.unsqueeze(1))
+    side_d1, _ = _derivatives(side_rel.unsqueeze(1))
+    center_speed = center_d1.squeeze(1).norm(dim=-1, keepdim=True)
+    side_speed = side_d1.squeeze(1).abs()
+    return torch.cat(
+        [raw_width, raw_height, raw_area, raw_open_ratio, center_rel, side_rel, side_abs, center_speed, side_speed],
+        dim=-1,
+    )
+
+
+def _mouth_motion_features(landmarks: torch.Tensor, crop_boxes: torch.Tensor | None = None) -> torch.Tensor:
+    xy = torch.nan_to_num(landmarks[..., :2].float(), nan=0.0, posinf=0.0, neginf=0.0)
+    min_xy = xy.amin(dim=1)
+    max_xy = xy.amax(dim=1)
+    width_height = max_xy - min_xy
+    center = xy.mean(dim=1)
+    smooth_xy = _smooth_xy(xy)
+    d1, d2 = _derivatives(smooth_xy)
     speed = d1.norm(dim=-1).mean(dim=1, keepdim=True)
     accel = d2.norm(dim=-1).mean(dim=1, keepdim=True)
     mouth_open = xy[..., 1].std(dim=1, unbiased=False, keepdim=True)
     area = width_height[:, :1] * width_height[:, 1:2]
-    return torch.cat([center, width_height, mouth_open, area, speed, accel], dim=-1)
+    open_ratio = width_height[:, 1:2] / width_height[:, :1].clamp_min(1e-4)
+    box_features = _box_motion_features(crop_boxes, width_height)
+    return torch.cat([center, width_height, mouth_open, area, open_ratio, speed, accel, box_features], dim=-1)
 
 
 def extract_window(path: str | Path, item: dict[str, Any], start: int, window_frames: int, clip_index: int = 0) -> dict[str, Any]:
@@ -171,20 +254,28 @@ def extract_window(path: str | Path, item: dict[str, Any], start: int, window_fr
     mel_idx = mel_indices_for_video_window(item, start, end)
     if mel_idx.numel() <= 0:
         mel_idx = torch.arange(0, max(1, min(1, int(item["mel_len"]))), dtype=torch.long)
+    mel_idx, target_mel_idx = _target_mel_indices(
+        mel_idx,
+        int(item["mel_len"]),
+        int(item.get("audio_target_shift_frames", 0)),
+    )
 
     video_times = item["video_times"][start:end].float()
     mel_times = item["mel_times"][mel_idx].float()
     t0 = float(video_times[0].item()) if video_times.numel() else 0.0
     landmarks = item["landmarks"][start:end].float()
+    crop_boxes = item.get("crop_boxes")
+    if torch.is_tensor(crop_boxes):
+        crop_boxes = crop_boxes[start:end].float()
 
     return {
         "video": item["video"][:, start:end].float(),
         "landmarks": landmarks,
-        "mel": item["mel"][mel_idx].float(),
+        "mel": item["mel"][target_mel_idx].float(),
         "video_times": video_times - t0,
         "mel_times": mel_times - t0,
         "mouth_valid_mask": item["mouth_valid_mask"][start:end].bool(),
-        "mouth_motion": _mouth_motion_features(landmarks),
+        "mouth_motion": _mouth_motion_features(landmarks, crop_boxes),
         "video_len": int(end - start),
         "mel_len": int(mel_idx.numel()),
         "path": str(path),
@@ -192,6 +283,7 @@ def extract_window(path: str | Path, item: dict[str, Any], start: int, window_fr
         "window_start": int(start),
         "window_end": int(end),
         "mel_indices": mel_idx.long(),
+        "target_mel_indices": target_mel_idx.long(),
         "clip_index": int(clip_index),
     }
 
@@ -207,6 +299,7 @@ class WindowedR2INRDataset(Dataset):
         cache_size: int = 2,
         seed: int = 42,
         limit: int | None = None,
+        audio_target_shift_frames: int = 0,
     ):
         self.data_dir = Path(data_dir)
         resolved = _resolve_files(self.data_dir, files)
@@ -216,6 +309,7 @@ class WindowedR2INRDataset(Dataset):
         self.window_frames = int(window_frames)
         self.hop_frames = int(hop_frames)
         self.cache_size = max(0, int(cache_size))
+        self.audio_target_shift_frames = int(audio_target_shift_frames)
         self._cache: OrderedDict[Path, dict[str, Any]] = OrderedDict()
         self.seed = int(seed)
         self.index: list[tuple[int, int]] = []
@@ -254,6 +348,9 @@ class WindowedR2INRDataset(Dataset):
         file_idx, start = self.index[idx]
         path = self.files[file_idx]
         item = self._get_item(path)
+        if self.audio_target_shift_frames:
+            item = dict(item)
+            item["audio_target_shift_frames"] = self.audio_target_shift_frames
         return extract_window(path, item, start, self.window_frames, clip_index=file_idx)
 
 
