@@ -50,7 +50,7 @@ def evaluate_variant(model, loader, criterion, device, variant: str, max_batches
             break
         batch = batch_to_device(batch, device)
         vbatch = apply_variant(batch, variant)
-        pred = model(model_inputs(vbatch))
+        pred = model(**model_inputs(vbatch))
         loss = criterion(pred.float(), batch["mel"].float(), batch["mel_mask"])
         total += float(loss.detach().cpu())
         count += 1

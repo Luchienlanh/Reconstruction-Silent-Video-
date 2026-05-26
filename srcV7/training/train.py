@@ -57,7 +57,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, args, e
             if freeze_visual:
                 raw_model.encoder.visual.eval()
             with torch.amp.autocast("cuda", enabled=amp_enabled):
-                out = model(model_inputs(batch), return_aux=args.lambda_stats > 0)
+                out = model(**model_inputs(batch), return_aux=args.lambda_stats > 0)
                 pred = out["mel"] if isinstance(out, dict) else out
             with torch.amp.autocast("cuda", enabled=False):
                 if not torch.isfinite(pred).all():
@@ -104,7 +104,7 @@ def evaluate(model, loader, criterion, device, args, plot_path=None, epoch=0):
     for batch in tqdm(loader, desc="val", leave=False):
         batch = batch_to_device(batch, device)
         batch = sanitize_batch(batch)
-        pred = model(model_inputs(batch))
+        pred = model(**model_inputs(batch))
         if not torch.isfinite(pred).all():
             print(f"[warn] non-finite eval pred; paths={batch.get('paths', [])[:4]}")
             pred = torch.nan_to_num(pred.float(), nan=0.0, posinf=20.0, neginf=-20.0)

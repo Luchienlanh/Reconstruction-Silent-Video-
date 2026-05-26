@@ -505,7 +505,16 @@ class R2CNNFiLMModel(nn.Module):
             nn.Linear(dim, 160),
         )
 
-    def forward(self, batch: dict[str, torch.Tensor], return_aux: bool = False):
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor] | None = None,
+        return_aux: bool = False,
+        **kwargs: torch.Tensor,
+    ):
+        if batch is None:
+            batch = kwargs
+        elif kwargs:
+            batch = {**batch, **kwargs}
         encoded = self.encoder(batch)
         mel = self.decoder(encoded, batch["mel_times"], batch.get("mel_mask"))
         if not return_aux:
@@ -547,7 +556,16 @@ class R2CNNPlainModel(nn.Module):
             nn.Linear(dim, 160),
         )
 
-    def forward(self, batch: dict[str, torch.Tensor], return_aux: bool = False):
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor] | None = None,
+        return_aux: bool = False,
+        **kwargs: torch.Tensor,
+    ):
+        if batch is None:
+            batch = kwargs
+        elif kwargs:
+            batch = {**batch, **kwargs}
         encoded = self.encoder(batch)
         mel = self.decoder(encoded, batch["mel_times"], batch.get("mel_mask"))
         if not return_aux:

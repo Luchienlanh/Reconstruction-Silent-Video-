@@ -85,7 +85,7 @@ def run(args) -> None:
                 raw_model.encoder.eval()
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=amp_enabled):
-                pred = model(model_inputs(batch))
+                pred = model(**model_inputs(batch))
             with torch.amp.autocast("cuda", enabled=False):
                 loss = criterion(pred.float(), batch["mel"].float(), batch["mel_mask"])
             if not torch.isfinite(loss):
@@ -99,7 +99,7 @@ def run(args) -> None:
 
         model.eval()
         with torch.no_grad():
-            pred_eval = model(model_inputs(batch))
+            pred_eval = model(**model_inputs(batch))
             eval_loss = criterion(pred_eval.float(), batch["mel"].float(), batch["mel_mask"])
             stats = masked_stats(pred_eval, batch["mel"], batch["mel_mask"])
         best = min(best, float(eval_loss.detach().cpu()))
