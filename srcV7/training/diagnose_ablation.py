@@ -74,6 +74,7 @@ def run(args) -> None:
         "dropout",
         "multi_gpu",
         "upsample_mode",
+        "decoder_type",
         "decoder_channels",
         "decoder_layers",
         "decoder_kernel_size",
@@ -108,9 +109,9 @@ def run(args) -> None:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Input ablation for srcV7 CNN-FiLM checkpoints.")
+    parser = argparse.ArgumentParser(description="Input ablation for srcV7 CNN checkpoints.")
     parser.add_argument("--data-dir", default="Processed_Data_R2INR")
-    parser.add_argument("--checkpoint", default="checkpoints_r2cnnfilm_v7/best_model.pth")
+    parser.add_argument("--checkpoint", default="checkpoints_srcV7_cnn_plain/best_model.pth")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--multi-gpu", default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -122,6 +123,7 @@ def parse_args():
     parser.add_argument("--dim", type=int, default=512)
     parser.add_argument("--spatial-tokens", type=int, default=4)
     parser.add_argument("--upsample-mode", default="conv_transpose", choices=["linear", "conv_transpose"])
+    parser.add_argument("--decoder-type", default="cnn_plain", choices=["cnn_plain", "cnn_film"])
     parser.add_argument("--decoder-channels", type=int, default=None)
     parser.add_argument("--decoder-layers", type=int, default=8)
     parser.add_argument("--decoder-kernel-size", type=int, default=5)
@@ -132,4 +134,3 @@ def parse_args():
 
 if __name__ == "__main__":
     run(parse_args())
-

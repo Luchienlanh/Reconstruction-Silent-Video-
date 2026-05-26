@@ -259,6 +259,29 @@ class FiLMConvBlock(nn.Module):
         return x
 
 
+class PlainConvBlock(nn.Module):
+    def __init__(self, channels: int, kernel_size: int = 5, dilation: int = 1, dropout: float = 0.0):
+        super().__init__()
+        padding = (kernel_size // 2) * dilation
+        self.norm = norm1d(channels)
+        self.conv = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding, dilation=dilation)
+        self.ffn_norm = norm1d(channels)
+        self.ffn = nn.Sequential(
+            nn.Conv1d(channels, channels * 2, kernel_size=1),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(channels * 2, channels, kernel_size=1),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        x = x + self.dropout(F.silu(self.conv(self.norm(x))))
+        x = x + self.dropout(self.ffn(self.ffn_norm(x)))
+        if mask is not None:
+            x = x * mask.unsqueeze(1).to(x.dtype)
+        return x
+
+
 class CNNFiLMMelDecoder(nn.Module):
     def __init__(
         self,
@@ -346,6 +369,111 @@ class CNNFiLMMelDecoder(nn.Module):
         return out
 
 
+class CNNPlainMelDecoder(nn.Module):
+    def __init__(
+        self,
+        dim: int = 512,
+        channels: int = 512,
+        out_dim: int = 80,
+        layers: int = 8,
+        kernel_size: int = 5,
+        dropout: float = 0.0,
+        output_bias_init: float = -4.0,
+        upsample_mode: str = "conv_transpose",
+    ):
+        super().__init__()
+        self.upsample_mode = upsample_mode.lower()
+        self.time = TimeFourier(dim, num_freqs=64, max_freq=96.0)
+        if self.upsample_mode == "conv_transpose":
+            self.learned_upsample = nn.Sequential(
+                nn.ConvTranspose1d(dim, dim, kernel_size=4, stride=2, padding=1),
+                nn.SiLU(),
+                nn.Conv1d(dim, dim, kernel_size=3, padding=1),
+            )
+        self.global_proj = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim))
+        self.cond_proj = nn.Sequential(
+            nn.LayerNorm(dim * 3),
+            nn.Linear(dim * 3, dim * 2),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 2, dim),
+            nn.LayerNorm(dim),
+        )
+        self.direct = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, out_dim),
+        )
+        self.input = nn.Conv1d(dim, channels, kernel_size=1)
+        dilations = [1, 2, 4, 8]
+        self.blocks = nn.ModuleList(
+            [
+                PlainConvBlock(
+                    channels=channels,
+                    kernel_size=kernel_size,
+                    dilation=dilations[i % len(dilations)],
+                    dropout=dropout,
+                )
+                for i in range(layers)
+            ]
+        )
+        self.residual = nn.Sequential(
+            norm1d(channels),
+            nn.SiLU(),
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv1d(channels, out_dim, kernel_size=1),
+        )
+        self.residual_scale = nn.Parameter(torch.tensor(0.25))
+        nn.init.constant_(self.direct[-1].bias, output_bias_init)
+        nn.init.normal_(self.direct[-1].weight, 0.0, 1e-3)
+        nn.init.zeros_(self.residual[-1].bias)
+        nn.init.normal_(self.residual[-1].weight, 0.0, 1e-3)
+
+    def init_output_bias(self, mel_mean: torch.Tensor) -> None:
+        last = self.direct[-1]
+        if last.bias is not None and last.bias.numel() == mel_mean.numel():
+            with torch.no_grad():
+                last.bias.copy_(mel_mean.to(device=last.bias.device, dtype=last.bias.dtype))
+        res_last = self.residual[-1]
+        if res_last.bias is not None:
+            with torch.no_grad():
+                res_last.bias.zero_()
+
+    def _align_frame_memory(self, encoded: dict[str, torch.Tensor], target_len: int) -> torch.Tensor:
+        frame_memory = encoded["frame_memory"]
+        if frame_memory.shape[1] == target_len:
+            return frame_memory
+        x = frame_memory.transpose(1, 2)
+        if self.upsample_mode == "conv_transpose":
+            x = self.learned_upsample(x)
+        x = F.interpolate(x, size=int(target_len), mode="linear", align_corners=False)
+        return x.transpose(1, 2).contiguous()
+
+    def forward(
+        self,
+        encoded: dict[str, torch.Tensor],
+        mel_times: torch.Tensor,
+        mel_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        target_len = int(mel_times.shape[1])
+        local = self._align_frame_memory(encoded, target_len)
+        global_rep = self.global_proj(encoded["global"]).unsqueeze(1).expand(-1, target_len, -1)
+        time = self.time(mel_times)
+        cond = self.cond_proj(torch.cat([local, global_rep, time], dim=-1))
+        coarse = self.direct(cond)
+        h = self.input(cond.transpose(1, 2))
+        for block in self.blocks:
+            h = block(h, mel_mask)
+        residual = self.residual(h).transpose(1, 2)
+        out = coarse + self.residual_scale * residual
+        if mel_mask is not None:
+            out = out * mel_mask.unsqueeze(-1).to(out.dtype)
+        return out
+
+
 class R2CNNFiLMModel(nn.Module):
     def __init__(
         self,
@@ -387,3 +515,44 @@ class R2CNNFiLMModel(nn.Module):
             "mel_stats": self.mel_stats_head(encoded["global"]),
         }
 
+
+class R2CNNPlainModel(nn.Module):
+    def __init__(
+        self,
+        dim: int = 512,
+        spatial_tokens: int = 4,
+        num_points: int = 40,
+        dropout: float = 0.0,
+        upsample_mode: str = "conv_transpose",
+        decoder_channels: int | None = None,
+        decoder_layers: int = 8,
+        decoder_kernel_size: int = 5,
+    ):
+        super().__init__()
+        channels = int(decoder_channels or dim)
+        self.encoder = R2MemoryEncoder(dim=dim, spatial_tokens=spatial_tokens, num_points=num_points, dropout=dropout)
+        self.decoder = CNNPlainMelDecoder(
+            dim=dim,
+            channels=channels,
+            out_dim=80,
+            layers=decoder_layers,
+            kernel_size=decoder_kernel_size,
+            dropout=dropout,
+            upsample_mode=upsample_mode,
+        )
+        self.mel_stats_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, 160),
+        )
+
+    def forward(self, batch: dict[str, torch.Tensor], return_aux: bool = False):
+        encoded = self.encoder(batch)
+        mel = self.decoder(encoded, batch["mel_times"], batch.get("mel_mask"))
+        if not return_aux:
+            return mel
+        return {
+            "mel": mel,
+            "mel_stats": self.mel_stats_head(encoded["global"]),
+        }

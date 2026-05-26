@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from srcV7.data import R2CacheDataset, collate_r2cache
-from srcV7.models import MaskedMelLoss, R2CNNFiLMModel
+from srcV7.models import MaskedMelLoss, R2CNNFiLMModel, R2CNNPlainModel
 from srcV7.utils.common import batch_to_device
 
 
@@ -102,8 +102,10 @@ def mean_baseline(loader: DataLoader | None, criterion: MaskedMelLoss, mel_mean:
     return total / max(1, count)
 
 
-def build_model(device: torch.device, args) -> R2CNNFiLMModel:
-    model = R2CNNFiLMModel(
+def build_model(device: torch.device, args) -> R2CNNPlainModel | R2CNNFiLMModel:
+    decoder_type = getattr(args, "decoder_type", "cnn_plain")
+    model_cls = R2CNNFiLMModel if decoder_type == "cnn_film" else R2CNNPlainModel
+    model = model_cls(
         dim=args.dim,
         spatial_tokens=args.spatial_tokens,
         num_points=args.num_landmark_points,
@@ -209,4 +211,3 @@ def sanitize_batch(batch: dict) -> dict:
             print(f"[warn] non-finite {key}; paths={paths[:4]}")
             batch[key] = torch.nan_to_num(batch[key], nan=0.0, posinf=0.0, neginf=0.0)
     return batch
-

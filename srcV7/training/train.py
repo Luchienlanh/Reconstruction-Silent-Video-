@@ -207,7 +207,7 @@ def run(args) -> None:
     print(f"[device] {device}")
     print(f"[data] train={len(train_files)} val={len(val_files)}")
     print(
-        f"[model] r2plus1d_cnn_film dim={args.dim} spatial_tokens={args.spatial_tokens} "
+        f"[model] r2plus1d_{args.decoder_type} dim={args.dim} spatial_tokens={args.spatial_tokens} "
         f"decoder_channels={args.decoder_channels or args.dim} layers={args.decoder_layers}"
     )
     print(f"[baseline] mean_train={mean_train:.6f} mean_val={'n/a' if mean_val is None else f'{mean_val:.6f}'}")
@@ -265,9 +265,9 @@ def run(args) -> None:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train srcV7 ResNet2+1D encoder + CNN-FiLM mel decoder.")
+    parser = argparse.ArgumentParser(description="Train srcV7 ResNet2+1D encoder + CNN mel decoder.")
     parser.add_argument("--data-dir", default="Processed_Data_R2INR")
-    parser.add_argument("--output-dir", default="checkpoints_r2cnnfilm_v7")
+    parser.add_argument("--output-dir", default="checkpoints_srcV7_cnn_plain")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--multi-gpu", default=True, action=argparse.BooleanOptionalAction)
@@ -300,6 +300,7 @@ def parse_args():
     parser.add_argument("--dim", type=int, default=512)
     parser.add_argument("--spatial-tokens", type=int, default=4)
     parser.add_argument("--upsample-mode", default="conv_transpose", choices=["linear", "conv_transpose"])
+    parser.add_argument("--decoder-type", default="cnn_plain", choices=["cnn_plain", "cnn_film"])
     parser.add_argument("--decoder-channels", type=int, default=None)
     parser.add_argument("--decoder-layers", type=int, default=8)
     parser.add_argument("--decoder-kernel-size", type=int, default=5)
@@ -314,4 +315,3 @@ def parse_args():
 
 if __name__ == "__main__":
     run(parse_args())
-

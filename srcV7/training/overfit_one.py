@@ -68,7 +68,7 @@ def run(args) -> None:
     print(f"[sample] {batch_cpu['paths'][0]}")
     print(f"[shape] video={tuple(batch['video'].shape)} landmarks={tuple(batch['landmarks'].shape)} mel={tuple(batch['mel'].shape)}")
     print(
-        f"[model] r2plus1d_cnn_film dim={args.dim} spatial_tokens={args.spatial_tokens} "
+        f"[model] r2plus1d_{args.decoder_type} dim={args.dim} spatial_tokens={args.spatial_tokens} "
         f"decoder_channels={args.decoder_channels or args.dim} layers={args.decoder_layers}"
     )
 
@@ -124,7 +124,7 @@ def run(args) -> None:
 def parse_args():
     parser = argparse.ArgumentParser(description="Fast overfit one srcV7 cache sample.")
     parser.add_argument("--data-dir", default="Processed_Data_R2INR")
-    parser.add_argument("--output-dir", default="overfit_r2cnnfilm_v7")
+    parser.add_argument("--output-dir", default="overfit_srcV7_cnn_plain")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--multi-gpu", default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--epochs", type=int, default=50)
@@ -143,6 +143,7 @@ def parse_args():
     parser.add_argument("--dim", type=int, default=512)
     parser.add_argument("--spatial-tokens", type=int, default=4)
     parser.add_argument("--upsample-mode", default="conv_transpose", choices=["linear", "conv_transpose"])
+    parser.add_argument("--decoder-type", default="cnn_plain", choices=["cnn_plain", "cnn_film"])
     parser.add_argument("--decoder-channels", type=int, default=None)
     parser.add_argument("--decoder-layers", type=int, default=8)
     parser.add_argument("--decoder-kernel-size", type=int, default=5)
@@ -161,4 +162,3 @@ def parse_args():
 
 if __name__ == "__main__":
     run(parse_args())
-
