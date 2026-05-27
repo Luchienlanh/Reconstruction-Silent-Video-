@@ -1,11 +1,17 @@
-librosa
-scipy
-ffmpeg
-mediapipe
-decord
-spikingjelly
-numpy
-torch
-matplotlib
-tqdm
-opencv-python
+# Core training / inference for srcV3
+torch>=2.1
+torchaudio>=2.1
+numpy>=1.24
+tqdm>=4.66
+matplotlib>=3.7
+
+# Cache building from raw videos / embedded audio
+opencv-python>=4.8
+scipy>=1.10
+librosa>=0.10
+soundfile>=0.12
+
+# Optional: only needed when building cache without --no-mediapipe.
+# MediaPipe wheels are usually safest on Python 3.10/3.11; on Python 3.12,
+# build LRS2 cache with --no-mediapipe if pip cannot resolve this package.
+mediapipe>=0.10; python_version < "3.12"
