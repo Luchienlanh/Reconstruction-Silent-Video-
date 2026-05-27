@@ -26,6 +26,7 @@ def run(args: argparse.Namespace) -> None:
         window_frames=args.window_frames,
         hop_frames=args.hop_frames,
         max_windows_per_file=args.max_windows_per_file,
+        random_windows_per_file=0,
         seed=args.seed,
     )
     idx = max(0, min(args.window_index, len(dataset) - 1))

@@ -139,6 +139,7 @@ class WindowedMelDataset(Dataset):
         window_frames: int = 30,
         hop_frames: int = 10,
         max_windows_per_file: int = 0,
+        random_windows_per_file: int = 0,
         seed: int = 42,
     ):
         self.data_dir = Path(data_dir)
@@ -154,20 +155,40 @@ class WindowedMelDataset(Dataset):
         self.window_frames = int(window_frames)
         self.hop_frames = int(hop_frames)
         self.seed = int(seed)
+        self.max_windows_per_file = int(max_windows_per_file)
+        self.random_windows_per_file = int(random_windows_per_file)
         self.index: list[tuple[int, int]] = []
-        self._build_index(max_windows_per_file=max_windows_per_file)
+        self.file_starts: list[list[int]] = []
+        self._build_index()
 
-    def _build_index(self, max_windows_per_file: int = 0) -> None:
+    def _build_index(self) -> None:
         rng = random.Random(self.seed)
         for file_idx, path in enumerate(self.files):
             item = load_cache(path)
             starts = window_starts(int(item["video_len"]), self.window_frames, self.hop_frames)
-            if max_windows_per_file and len(starts) > max_windows_per_file:
+            self.file_starts.append([int(s) for s in starts])
+            limit = self.random_windows_per_file or self.max_windows_per_file
+            if limit and len(starts) > limit:
                 rng.shuffle(starts)
-                starts = sorted(starts[: int(max_windows_per_file)])
+                starts = sorted(starts[: int(limit)])
             self.index.extend((file_idx, int(s)) for s in starts)
         if not self.index:
             raise RuntimeError("No usable windows were created.")
+
+    def resample_windows(self, epoch: int = 0) -> None:
+        if self.random_windows_per_file <= 0:
+            return
+        rng = random.Random(self.seed + int(epoch) * 1000003)
+        index: list[tuple[int, int]] = []
+        for file_idx, starts in enumerate(self.file_starts):
+            chosen = list(starts)
+            if len(chosen) > self.random_windows_per_file:
+                rng.shuffle(chosen)
+                chosen = sorted(chosen[: self.random_windows_per_file])
+            index.extend((file_idx, int(s)) for s in chosen)
+        if not index:
+            raise RuntimeError("No usable windows after resampling.")
+        self.index = index
 
     def __len__(self) -> int:
         return len(self.index)

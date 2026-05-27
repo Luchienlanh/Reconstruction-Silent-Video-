@@ -26,6 +26,7 @@ def make_loader(
     window_frames: int,
     hop_frames: int,
     max_windows_per_file: int,
+    random_windows_per_file: int,
     seed: int,
     num_workers: int,
     shuffle: bool,
@@ -37,6 +38,7 @@ def make_loader(
         window_frames=window_frames,
         hop_frames=hop_frames,
         max_windows_per_file=max_windows_per_file,
+        random_windows_per_file=random_windows_per_file,
         seed=seed,
     )
     return DataLoader(
@@ -170,6 +172,8 @@ def set_visual_trainable(model: torch.nn.Module, trainable: bool) -> None:
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, args, epoch: int) -> float:
     model.train()
+    if hasattr(loader.dataset, "resample_windows"):
+        loader.dataset.resample_windows(epoch)
     freeze_visual = epoch <= args.freeze_visual_epochs
     set_visual_trainable(model, not freeze_visual)
     amp_enabled = device.type == "cuda" and args.amp
@@ -227,6 +231,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hop-frames", type=int, default=10)
     parser.add_argument("--limit-files", type=int, default=0)
     parser.add_argument("--max-windows-per-file", type=int, default=0)
+    parser.add_argument("--random-windows-per-file", type=int, default=0)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--dim", type=int, default=512)
@@ -278,6 +283,7 @@ def run(args: argparse.Namespace) -> None:
         args.window_frames,
         args.hop_frames,
         args.max_windows_per_file,
+        args.random_windows_per_file,
         args.seed,
         args.num_workers,
         shuffle=True,
@@ -292,6 +298,7 @@ def run(args: argparse.Namespace) -> None:
             args.window_frames,
             args.hop_frames,
             args.max_windows_per_file,
+            0,
             args.seed + 1,
             args.num_workers,
             shuffle=False,
@@ -304,6 +311,7 @@ def run(args: argparse.Namespace) -> None:
         args.window_frames,
         args.hop_frames,
         args.max_windows_per_file,
+        0,
         args.seed,
         args.num_workers,
         shuffle=False,
@@ -327,6 +335,8 @@ def run(args: argparse.Namespace) -> None:
     print(f"[device] {device}")
     print(f"[data] files train={len(train_files)} val={len(val_files)} windows train={len(train_loader.dataset)}")
     print(f"[window] frames={args.window_frames} hop={args.hop_frames}")
+    if args.random_windows_per_file > 0:
+        print(f"[sampling] random_windows_per_file={args.random_windows_per_file}")
     print(f"[model] decoder={args.decoder_type} fusion={args.fusion_type} dim={args.dim} width={args.encoder_width}")
     print(f"[baseline] mean_train={mean_train:.6f} mean_val={mean_val if mean_val is not None else 'n/a'}")
 

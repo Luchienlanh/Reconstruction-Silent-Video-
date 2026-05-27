@@ -6,6 +6,8 @@ import torch
 
 
 def save_mel_comparison(pred: torch.Tensor, target: torch.Tensor, path: str | Path, title: str = "") -> None:
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     path = Path(path)
