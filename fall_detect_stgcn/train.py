@@ -23,7 +23,13 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from fall_detect_stgcn.dataset import UPFallPoseDataset, filter_pose_files, list_pose_files, parse_subjects
+from fall_detect_stgcn.dataset import (
+    UPFallPoseDataset,
+    filter_pose_files,
+    list_pose_files,
+    parse_subjects,
+    read_meta,
+)
 from fall_detect_stgcn.labels import FALL_ACTIVITIES, label_names
 from fall_detect_stgcn.pose_features import INPUT_DIM
 from fall_detect_stgcn.models.registry import MODEL_TYPES, build_model
@@ -52,6 +58,47 @@ def split_random_files(
     train_end = min(max(train_end, 0), total)
     val_end = min(max(val_end, train_end), total)
     return shuffled[:train_end], shuffled[train_end:val_end], shuffled[val_end:]
+
+
+def subjects_in_files(files: list[Path]) -> list[int]:
+    subjects = {int(read_meta(path)["subject"]) for path in files}
+    return sorted(subjects)
+
+
+def split_subject_kfold(
+    files: list[Path],
+    k_folds: int,
+    fold_index: int,
+    seed: int,
+    val_offset: int = 1,
+) -> tuple[list[Path], list[Path], list[Path], set[int], set[int], set[int]]:
+    """Subject-independent k-fold split.
+
+    test fold = fold_index, validation fold = fold_index + val_offset, train = rest.
+    """
+    if k_folds < 2:
+        raise ValueError("--k-folds must be at least 2.")
+    subjects = subjects_in_files(files)
+    if k_folds > len(subjects):
+        raise ValueError(f"--k-folds={k_folds} is larger than available subjects={len(subjects)}.")
+    if fold_index < 0 or fold_index >= k_folds:
+        raise ValueError(f"--fold-index must be in [0, {k_folds - 1}].")
+
+    shuffled = list(subjects)
+    random.Random(seed).shuffle(shuffled)
+    folds = [set(map(int, fold)) for fold in np.array_split(shuffled, k_folds)]
+
+    test_subjects = folds[fold_index]
+    val_subjects = folds[(fold_index + val_offset) % k_folds]
+    train_subjects = set(subjects) - test_subjects - val_subjects
+    return (
+        filter_pose_files(files, train_subjects),
+        filter_pose_files(files, val_subjects),
+        filter_pose_files(files, test_subjects),
+        train_subjects,
+        val_subjects,
+        test_subjects,
+    )
 
 
 def configure_console_encoding() -> None:
@@ -241,6 +288,9 @@ def save_checkpoint(
         "train_ratio": args.train_ratio,
         "val_ratio": args.val_ratio,
         "test_ratio": args.test_ratio,
+        "k_folds": args.k_folds,
+        "fold_index": args.fold_index,
+        "kfold_val_offset": args.kfold_val_offset,
         "seed": args.seed,
     }
     torch.save(
@@ -264,13 +314,21 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--task", choices=["multiclass", "binary"], default="multiclass")
     parser.add_argument("--model-type", choices=MODEL_TYPES, default="spiking_stgcn")
     parser.add_argument("--seq-len", type=int, default=64)
-    parser.add_argument("--split-mode", choices=["subject", "random"], default="subject")
+    parser.add_argument("--split-mode", choices=["subject", "random", "kfold"], default="subject")
     parser.add_argument("--train-subjects", default="1-13")
     parser.add_argument("--val-subjects", default="14-15")
     parser.add_argument("--test-subjects", default="16-17")
     parser.add_argument("--train-ratio", type=float, default=0.6)
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--test-ratio", type=float, default=0.2)
+    parser.add_argument("--k-folds", type=int, default=5)
+    parser.add_argument("--fold-index", type=int, default=0)
+    parser.add_argument(
+        "--kfold-val-offset",
+        type=int,
+        default=1,
+        help="Validation fold offset relative to test fold in subject k-fold mode.",
+    )
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -304,11 +362,12 @@ def main() -> int:
         print(f"No .npz pose files found in {pose_dir}. Run extract_upfall_pose.py first.", file=sys.stderr)
         return 2
 
+    split_subject_info = None
     if args.split_mode == "subject":
         train_files = filter_pose_files(all_files, parse_subjects(args.train_subjects))
         val_files = filter_pose_files(all_files, parse_subjects(args.val_subjects))
         test_files = filter_pose_files(all_files, parse_subjects(args.test_subjects))
-    else:
+    elif args.split_mode == "random":
         train_files, val_files, test_files = split_random_files(
             all_files,
             train_ratio=args.train_ratio,
@@ -316,6 +375,22 @@ def main() -> int:
             test_ratio=args.test_ratio,
             seed=args.seed,
         )
+    else:
+        (
+            train_files,
+            val_files,
+            test_files,
+            train_subjects,
+            val_subjects,
+            test_subjects,
+        ) = split_subject_kfold(
+            all_files,
+            k_folds=args.k_folds,
+            fold_index=args.fold_index,
+            seed=args.seed,
+            val_offset=args.kfold_val_offset,
+        )
+        split_subject_info = (train_subjects, val_subjects, test_subjects)
     if args.max_samples is not None:
         train_files = train_files[: args.max_samples]
         val_files = val_files[: args.max_samples]
@@ -346,6 +421,12 @@ def main() -> int:
     print(f"Device: {device}")
     print(f"Task: {args.task} ({num_classes} classes)")
     print(f"Split mode: {args.split_mode}")
+    if split_subject_info is not None:
+        train_subjects, val_subjects, test_subjects = split_subject_info
+        print(f"K-fold: {args.fold_index + 1}/{args.k_folds}")
+        print(f"Train subjects: {sorted(train_subjects)}")
+        print(f"Val subjects:   {sorted(val_subjects)}")
+        print(f"Test subjects:  {sorted(test_subjects)}")
     print(f"Files: train={len(train_files)} val={len(val_files)} test={len(test_files)}")
 
     model = build_model(
