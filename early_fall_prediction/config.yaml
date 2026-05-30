@@ -1,0 +1,71 @@
+# ============================================================
+# Early Fall Prediction System - Configuration
+# ============================================================
+# Tất cả tham số hệ thống tập trung tại đây.
+# Khi tinh chỉnh hệ thống, chỉ cần sửa file này
+# mà không phải thay đổi code bên trong các module.
+# ============================================================
+
+# --- Camera / Video Input ---
+camera:
+  device_index: 0              # Webcam index, hoặc đường dẫn file video
+  width: 1280
+  height: 720
+  fps: 30
+
+# --- Model Weights Paths ---
+model_paths:
+  terrain_seg: "weights/yolov8n-seg.pt"           # Fine-tuned tren du lieu UE5 (4 class tuy chinh)
+  depth: "weights/depth_anything_v2_vits.pth"      # Depth Anything V2
+  pose: "weights/pose_landmarker_full.task"         # MediaPipe Pose Landmarker
+  snn_temporal: "weights/snn_temporal_best.pt"      # SNN Temporal Module
+  kan_fusion: "weights/kan_fusion_best.pt"          # KAN Risk Fusion
+
+# --- Terrain Perception ---
+# Su dung mo hinh YOLOv8-seg da fine-tune tren du lieu UE5.
+# 4 class duoi day tuong ung voi cac loai dia hinh nguy hiem trong mo phong.
+# Class mapping (khop voi convert_ue5_to_yolo.py):
+#   1 = obstacle    (vat can cao - Mau Do)
+#   2 = pothole     (o ga / ho sau - Mau Xanh Duong)
+#   3 = step_edge   (go bac / bac thang - Mau Xanh La)
+#   4 = wet_surface (mat duong tron - Mau Vang)
+terrain:
+  confidence_threshold: 0.40   # Giam nguong de tang Recall (it bo sot vat can hon)
+  hazard_classes:              # Class ID trong mo hinh fine-tuned (KHONG phai COCO)
+    - 1   # obstacle    - vat can cao
+    - 2   # pothole     - o ga, ho sau
+    - 3   # step_edge   - go bac, bac thang
+    - 4   # wet_surface - mat duong tron uot
+  detect_every_n_frames: 3     # Chay detection moi 3 frames (tang tan so phat hien)
+
+# --- Depth Estimation ---
+depth:
+  encoder: "vits"              # vitl | vitb | vits
+  input_size: 518
+  run_every_n_frames: 5        # Chạy depth mỗi N frames
+
+# --- Pose & Gait Analysis ---
+pose:
+  model_complexity: 1          # 0: lite, 1: full, 2: heavy
+  min_detection_confidence: 0.5
+  min_tracking_confidence: 0.5
+
+# --- Trajectory Prediction ---
+trajectory:
+  history_length: 30           # Số frame lưu lịch sử quỹ đạo chân
+  prediction_horizon_sec: 1.0  # Dự đoán trước bao nhiêu giây
+
+# --- Risk Assessment ---
+risk:
+  warning_threshold: 0.70      # Risk score >= giá trị này -> cảnh báo
+  danger_threshold: 0.85       # Risk score >= giá trị này -> cảnh báo khẩn cấp
+  collision_distance_px: 120   # Khoảng cách pixel tối thiểu coi là gần vật cản
+  alert_cooldown_sec: 3.0      # Thời gian chờ giữa hai lần phát cảnh báo
+
+# --- Visualization ---
+visualization:
+  show_hazard_overlay: true    # Tô đỏ vùng hazard mask lên video
+  show_skeleton: true          # Hiển thị khung xương
+  show_trajectory: true        # Hiển thị quỹ đạo bước chân
+  show_depth_map: false        # Hiển thị depth map phụ (ở góc nhỏ)
+  overlay_alpha: 0.35          # Độ trong suốt lớp phủ hazard

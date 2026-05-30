@@ -1,0 +1,9 @@
+names:
+  0: safe_ground
+  1: obstacle
+  2: pothole
+  3: step_edge
+  4: wet_surface
+path: C:\Users\Long\Downloads\Reconstruction-Silent-Video-\early_fall_prediction\data\terrain
+train: images/train
+val: images/val

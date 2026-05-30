@@ -1,0 +1,22 @@
+# Core AI & Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Computer Vision & Image Processing
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Models & Algorithms
+mediapipe>=0.10.0      # Cho Pose & Gait
+ultralytics>=8.0.0     # Cho YOLOv8 (Terrain Perception)
+
+# Machine Learning & Metrics
+scikit-learn>=1.3.0    # Dùng trong evaluate.py (Accuracy, Recall, F1...)
+
+# Data Handling & Simulation
+h5py>=3.9.0            # Để đọc dữ liệu HDF5 từ BlenderProc
+PyYAML>=6.0            # Đọc file config.yaml
+
+# Simulator (Tùy chọn, chỉ cần nếu bạn tự sinh dữ liệu mô phỏng)
+# Cài đặt blenderproc cần Python >= 3.10
+blenderproc>=2.4.0     # Sinh dữ liệu Synthetic
