@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import urllib.request
 from pathlib import Path
 
 import cv2
@@ -15,12 +16,45 @@ from srcV2.utils.audio import log_mel_from_audio
 from srcV2.utils.common import safe_name, seed_everything
 
 
+DEFAULT_FACE_LANDMARKER_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+
+
 LIP_LANDMARK_IDXS = [
     61, 146, 91, 181, 84, 17, 314, 405, 321, 375,
     291, 185, 40, 39, 37, 0, 267, 269, 270, 409,
     78, 95, 88, 178, 87, 14, 317, 402, 318, 324,
     308, 191, 80, 81, 82, 13, 312, 311, 310, 415,
 ]
+
+
+def resolve_face_landmarker_model(model_path: str | Path, auto_download: bool = True) -> Path:
+    path = Path(model_path).expanduser()
+    candidates = [path]
+    if not path.is_absolute():
+        repo_root = Path(__file__).resolve().parents[1]
+        candidates.extend(
+            [
+                Path.cwd() / path,
+                repo_root / path,
+                repo_root.parent / path,
+            ]
+        )
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+
+    if not auto_download:
+        raise FileNotFoundError(f"FaceLandmarker task model not found: {model_path}")
+
+    download_path = candidates[1] if len(candidates) > 1 else path
+    download_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[landmarks] downloading FaceLandmarker model -> {download_path}")
+    urllib.request.urlretrieve(DEFAULT_FACE_LANDMARKER_URL, download_path)
+    return download_path.resolve()
 
 
 def scan_raw_pairs(raw_dir: str | Path) -> list[tuple[Path, Path]]:
@@ -124,7 +158,12 @@ def add_derivatives(xy: torch.Tensor) -> torch.Tensor:
 
 
 class LipLandmarkExtractor:
-    def __init__(self, enabled: bool = True, model_path: str | Path = "face_landmarker_v2_with_blendshapes.task"):
+    def __init__(
+        self,
+        enabled: bool = True,
+        model_path: str | Path = "face_landmarker_v2_with_blendshapes.task",
+        auto_download: bool = True,
+    ):
         self.enabled = enabled
         self.backend = "none"
         self.face_mesh = None
@@ -150,9 +189,7 @@ class LipLandmarkExtractor:
             from mediapipe.tasks import python
             from mediapipe.tasks.python import vision
 
-            model_path = Path(model_path)
-            if not model_path.is_file():
-                raise FileNotFoundError(f"FaceLandmarker task model not found: {model_path}")
+            model_path = resolve_face_landmarker_model(model_path, auto_download=auto_download)
             options = vision.FaceLandmarkerOptions(
                 base_options=python.BaseOptions(model_asset_path=str(model_path)),
                 output_face_blendshapes=False,
@@ -312,7 +349,11 @@ def run(args) -> None:
     if not pairs:
         raise RuntimeError(f"No video.mp4/audio.wav pairs found under {args.raw_dir}")
 
-    extractor = LipLandmarkExtractor(enabled=not args.no_mediapipe, model_path=args.face_landmarker_model)
+    extractor = LipLandmarkExtractor(
+        enabled=not args.no_mediapipe,
+        model_path=args.face_landmarker_model,
+        auto_download=not args.no_download_face_landmarker,
+    )
     manifest = []
     failures = []
     try:
@@ -364,6 +405,11 @@ def parse_args():
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-mediapipe", action="store_true", help="Use center crop fallback for every frame.")
     parser.add_argument("--face-landmarker-model", default="face_landmarker_v2_with_blendshapes.task")
+    parser.add_argument(
+        "--no-download-face-landmarker",
+        action="store_true",
+        help="Do not auto-download the default MediaPipe FaceLandmarker task model when it is missing.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 

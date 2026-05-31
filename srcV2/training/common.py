@@ -63,6 +63,8 @@ def model_inputs(batch: dict) -> dict:
         "mel_times",
         "video_mask",
         "mel_mask",
+        "speech_units",
+        "speech_unit_mask",
         "mouth_valid_mask",
         "video_lengths",
         "mel_lengths",

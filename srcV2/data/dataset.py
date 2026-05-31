@@ -75,6 +75,8 @@ class R2INRDataset(Dataset):
         item["crop_boxes"] = item["crop_boxes"][start:end]
         item["mel"] = item["mel"][mel_mask]
         item["mel_times"] = item["mel_times"][mel_mask]
+        if "speech_units" in item:
+            item["speech_units"] = item["speech_units"][mel_mask]
         item["video_len"] = int(item["video"].shape[1])
         item["mel_len"] = int(item["mel"].shape[0])
         return item
@@ -82,7 +84,7 @@ class R2INRDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         path = self.files[idx]
         item = self._crop(_load_cache(path))
-        return {
+        out = {
             "video": item["video"].float(),
             "landmarks": item["landmarks"].float(),
             "mel": item["mel"].float(),
@@ -94,6 +96,10 @@ class R2INRDataset(Dataset):
             "path": str(path),
             "source_video": item.get("source_video", ""),
         }
+        if "speech_units" in item:
+            out["speech_units"] = item["speech_units"].long()
+            out["num_speech_units"] = int(item.get("num_speech_units", int(out["speech_units"].max().item()) + 1))
+        return out
 
 
 def _pad_video(video: torch.Tensor, length: int) -> torch.Tensor:
@@ -120,6 +126,12 @@ def _pad_bool(x: torch.Tensor, length: int) -> torch.Tensor:
     return F.pad(x, (0, length - x.shape[0]), value=False)
 
 
+def _pad_long(x: torch.Tensor, length: int, value: int = -100) -> torch.Tensor:
+    if x.shape[0] == length:
+        return x
+    return F.pad(x, (0, length - x.shape[0]), value=value)
+
+
 def collate_r2inr(batch: list[dict[str, Any]]) -> dict[str, Any]:
     v_lens = torch.tensor([b["video_len"] for b in batch], dtype=torch.long)
     m_lens = torch.tensor([b["mel_len"] for b in batch], dtype=torch.long)
@@ -137,7 +149,7 @@ def collate_r2inr(batch: list[dict[str, Any]]) -> dict[str, Any]:
     video_mask = torch.arange(t_video).unsqueeze(0) < v_lens.unsqueeze(1)
     mel_mask = torch.arange(t_mel).unsqueeze(0) < m_lens.unsqueeze(1)
 
-    return {
+    out = {
         "video": video,
         "landmarks": landmarks,
         "mel": mel,
@@ -151,3 +163,8 @@ def collate_r2inr(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "paths": paths,
         "source_videos": sources,
     }
+    if all("speech_units" in b for b in batch):
+        out["speech_units"] = torch.stack([_pad_long(b["speech_units"], t_mel, value=-100) for b in batch], dim=0)
+        out["speech_unit_mask"] = mel_mask.clone()
+        out["num_speech_units"] = max(int(b.get("num_speech_units", 0)) for b in batch)
+    return out
