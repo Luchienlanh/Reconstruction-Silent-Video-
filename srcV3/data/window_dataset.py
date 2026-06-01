@@ -112,7 +112,7 @@ def extract_window(
     else:
         crop_boxes = torch.zeros(end - start, 4)
 
-    return {
+    out = {
         "video": item["video"][:, start:end].float(),
         "landmarks": item["landmarks"][start:end].float(),
         "mel": item["mel"][mel_idx].float(),
@@ -129,6 +129,10 @@ def extract_window(
         "mel_indices": mel_idx.long(),
         "clip_index": int(clip_index),
     }
+    speech_units = item.get("speech_units")
+    if torch.is_tensor(speech_units):
+        out["speech_units"] = speech_units[mel_idx].long()
+    return out
 
 
 class WindowedMelDataset(Dataset):
@@ -165,7 +169,16 @@ class WindowedMelDataset(Dataset):
         rng = random.Random(self.seed)
         for file_idx, path in enumerate(self.files):
             item = load_cache(path)
-            starts = window_starts(int(item["video_len"]), self.window_frames, self.hop_frames)
+            cached = item.get("v3_window_index")
+            if (
+                isinstance(cached, dict)
+                and int(cached.get("window_frames", -1)) == self.window_frames
+                and int(cached.get("hop_frames", -1)) == self.hop_frames
+                and torch.is_tensor(cached.get("starts"))
+            ):
+                starts = [int(x) for x in cached["starts"].tolist()]
+            else:
+                starts = window_starts(int(item["video_len"]), self.window_frames, self.hop_frames)
             self.file_starts.append([int(s) for s in starts])
             limit = self.random_windows_per_file or self.max_windows_per_file
             if limit and len(starts) > limit:
@@ -245,7 +258,7 @@ def collate_windows(batch: list[dict[str, Any]]) -> dict[str, Any]:
 
     video_mask = torch.arange(max_video).unsqueeze(0) < video_lengths.unsqueeze(1)
     mel_mask = torch.arange(max_mel).unsqueeze(0) < mel_lengths.unsqueeze(1)
-    return {
+    out = {
         "video": video,
         "landmarks": landmarks,
         "mel": mel,
@@ -262,4 +275,8 @@ def collate_windows(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "window_ends": torch.tensor([b["window_end"] for b in batch], dtype=torch.long),
         "clip_indices": torch.tensor([b["clip_index"] for b in batch], dtype=torch.long),
     }
+    if all("speech_units" in b for b in batch):
+        out["speech_units"] = torch.stack([_pad_1d(b["speech_units"].float(), max_mel, value=-100).long() for b in batch], dim=0)
+        out["speech_unit_mask"] = mel_mask
+    return out
 
