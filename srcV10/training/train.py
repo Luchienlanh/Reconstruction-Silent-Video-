@@ -9,10 +9,84 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from srcV4.models.loss import V4MelLoss, masked_stats, speech_unit_loss, unit_frame_accuracy
+from srcV4.models.loss import V4MelLoss
+try:
+    from srcV4.models.loss import masked_stats
+except ImportError:
+    @torch.no_grad()
+    def masked_stats(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
+        mask = mask.to(pred.device, dtype=torch.bool)
+        p = pred.detach().float()[mask]
+        t = target.detach().float()[mask]
+        if p.numel() == 0 or t.numel() == 0:
+            return {}
+
+        def delta_abs(x: torch.Tensor) -> torch.Tensor:
+            if x.shape[0] < 2:
+                return x.new_tensor(0.0)
+            return (x[1:] - x[:-1]).abs().mean()
+
+        p_energy = torch.logsumexp(p, dim=-1)
+        t_energy = torch.logsumexp(t, dim=-1)
+        return {
+            "pred_std": float(p.std(unbiased=False).cpu()),
+            "target_std": float(t.std(unbiased=False).cpu()),
+            "std_ratio": float((p.std(unbiased=False) / t.std(unbiased=False).clamp_min(1e-6)).cpu()),
+            "pred_delta": float(delta_abs(p).cpu()),
+            "target_delta": float(delta_abs(t).cpu()),
+            "delta_ratio": float((delta_abs(p) / delta_abs(t).clamp_min(1e-6)).cpu()),
+            "energy_ratio": float((p_energy.std(unbiased=False) / t_energy.std(unbiased=False).clamp_min(1e-6)).cpu()),
+        }
+
+try:
+    from srcV4.models.loss import speech_unit_loss, unit_frame_accuracy
+except ImportError:
+    def speech_unit_loss(
+        unit_logits: torch.Tensor | None,
+        batch: dict,
+        label_smoothing: float = 0.0,
+    ) -> torch.Tensor:
+        if unit_logits is None or "speech_units" not in batch:
+            if unit_logits is not None:
+                return unit_logits.new_tensor(0.0)
+            mel = batch.get("mel")
+            if torch.is_tensor(mel):
+                return mel.new_tensor(0.0)
+            return torch.tensor(0.0)
+        logits = torch.nan_to_num(unit_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+        targets = batch["speech_units"].to(logits.device).long()
+        if targets.shape[1] != logits.shape[1]:
+            targets = F.interpolate(targets.float().unsqueeze(1), size=logits.shape[1], mode="nearest").squeeze(1).long()
+        if "mel_mask" in batch and batch["mel_mask"].shape[1] == targets.shape[1]:
+            valid = batch["mel_mask"].to(logits.device, dtype=torch.bool) & targets.ge(0)
+            targets = targets.masked_fill(~valid, -100)
+        return F.cross_entropy(
+            logits.transpose(1, 2),
+            targets,
+            ignore_index=-100,
+            label_smoothing=float(label_smoothing),
+        )
+
+    @torch.no_grad()
+    def unit_frame_accuracy(unit_logits: torch.Tensor | None, batch: dict) -> float:
+        if unit_logits is None or "speech_units" not in batch:
+            return 0.0
+        logits = torch.nan_to_num(unit_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+        targets = batch["speech_units"].to(logits.device).long()
+        if targets.shape[1] != logits.shape[1]:
+            targets = F.interpolate(targets.float().unsqueeze(1), size=logits.shape[1], mode="nearest").squeeze(1).long()
+        valid = targets.ge(0)
+        if "mel_mask" in batch and batch["mel_mask"].shape[1] == targets.shape[1]:
+            valid = valid & batch["mel_mask"].to(logits.device, dtype=torch.bool)
+        if not bool(valid.any()):
+            return 0.0
+        pred = logits.argmax(dim=-1)
+        return float((pred.eq(targets) & valid).float().sum().div(valid.float().sum().clamp_min(1.0)).detach().cpu())
+
 from srcV10.data import V10R2INRDataset, collate_v10, infer_av_feature_dim, split_cache_files
 from srcV10.models import V10PretrainedFusionSpeechModel
 from srcV10.utils import batch_to_device, get_device, seed_everything, unwrap_model, write_json
