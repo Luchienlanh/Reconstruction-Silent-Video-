@@ -658,8 +658,14 @@ class V4SpeechModel(nn.Module):
         siren_layers: int = 2,
         siren_omega: float = 20.0,
         visual_encoder_type: str = "r2plus1d",
+        use_content_units: bool = False,
+        num_units: int = 0,
+        unit_teacher_prob: float = 0.0,
     ):
         super().__init__()
+        self.use_content_units = bool(use_content_units and int(num_units) > 0)
+        self.num_units = int(num_units)
+        self.unit_teacher_prob = float(unit_teacher_prob)
         self.visual = AVHuBERTVisualFrontend(
             encoder_type=visual_encoder_type,
             dim=dim,
@@ -679,6 +685,18 @@ class V4SpeechModel(nn.Module):
         self.use_snn = use_snn
         if use_snn:
             self.snn = SpikingTemporalProcessor(dim=dim, n_layers=snn_layers, tau=snn_tau)
+
+        if self.use_content_units:
+            self.unit_head = nn.Linear(dim, self.num_units)
+            self.unit_embedding = nn.Embedding(self.num_units, dim)
+            self.content_fusion = nn.Sequential(
+                nn.Linear(dim * 2, dim),
+                nn.LayerNorm(dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim, dim),
+                nn.LayerNorm(dim),
+            )
             
         self.decoder = TFiLMConformerDecoder(
             dim=dim,
@@ -716,7 +734,38 @@ class V4SpeechModel(nn.Module):
             
         return fused
 
-    def forward(self, batch: dict[str, torch.Tensor], target_len: Optional[int] = None) -> torch.Tensor:
+    @staticmethod
+    def _resize_time(x: torch.Tensor, target_len: int) -> torch.Tensor:
+        if x.shape[1] == int(target_len):
+            return x
+        return F.interpolate(
+            x.transpose(1, 2),
+            size=int(target_len),
+            mode="linear",
+            align_corners=False,
+        ).transpose(1, 2).contiguous()
+
+    @staticmethod
+    def _resize_units(units: torch.Tensor, target_len: int) -> torch.Tensor:
+        if units.shape[1] == int(target_len):
+            return units
+        x = units.float().unsqueeze(1)
+        return F.interpolate(x, size=int(target_len), mode="nearest").squeeze(1).long()
+
+    def _unit_condition(self, unit_logits: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        probs = torch.softmax(unit_logits.float(), dim=-1).to(unit_logits.dtype)
+        soft_units = probs @ self.unit_embedding.weight.to(unit_logits.dtype)
+        if not self.training or self.unit_teacher_prob <= 0 or "speech_units" not in batch:
+            return soft_units
+
+        targets = self._resize_units(batch["speech_units"].to(unit_logits.device), unit_logits.shape[1])
+        valid = targets.ge(0) & targets.lt(self.num_units)
+        safe_targets = targets.clamp(0, max(0, self.num_units - 1))
+        teacher_units = self.unit_embedding(safe_targets).to(unit_logits.dtype)
+        mixed = (1.0 - self.unit_teacher_prob) * soft_units + self.unit_teacher_prob * teacher_units
+        return torch.where(valid.unsqueeze(-1), mixed, soft_units)
+
+    def forward(self, batch: dict[str, torch.Tensor], target_len: Optional[int] = None, return_aux: bool = False) -> torch.Tensor | dict[str, torch.Tensor]:
         if target_len is None:
             mel = batch.get("mel")
             if mel is not None:
@@ -727,18 +776,27 @@ class V4SpeechModel(nn.Module):
         
         # 2. Prepare conditioning signals (interpolated internally in Conformer)
         mel_mask = batch.get("mel_mask")
+        unit_logits = None
+
+        decoder_memory = memory
+        if self.use_content_units:
+            if target_len is None:
+                raise ValueError("target_len is required when use_content_units=True")
+            memory_mel = self._resize_time(memory, int(target_len))
+            unit_logits = self.unit_head(memory_mel)
+            unit_cond = self._unit_condition(unit_logits, batch)
+            decoder_memory = self.content_fusion(torch.cat([memory_mel, unit_cond], dim=-1))
+            if mel_mask is not None:
+                decoder_memory = decoder_memory * mel_mask.to(decoder_memory.device, decoder_memory.dtype).unsqueeze(-1)
         
         # 3. Decode coarse mel spectrogram
-        coarse_mel = self.decoder(memory, target_len=target_len, mel_mask=mel_mask) # (B, T_mel, 80)
+        coarse_mel = self.decoder(decoder_memory, target_len=target_len, mel_mask=mel_mask) # (B, T_mel, 80)
         
         # 4. Get upsampled condition for SIREN
-        if target_len is not None and memory.shape[1] != int(target_len):
-            cond_mel = F.interpolate(
-                memory.transpose(1, 2),
-                size=int(target_len),
-                mode="linear",
-                align_corners=False,
-            ).transpose(1, 2).contiguous()
+        if self.use_content_units:
+            cond_mel = decoder_memory
+        elif target_len is not None and memory.shape[1] != int(target_len):
+            cond_mel = self._resize_time(memory, int(target_len))
         else:
             cond_mel = memory
             
@@ -746,4 +804,11 @@ class V4SpeechModel(nn.Module):
         res_mel = self.siren_residual(coarse_mel, cond_mel)
         final_mel = coarse_mel + res_mel
         
-        return final_mel
+        if not return_aux:
+            return final_mel
+        return {
+            "mel": final_mel,
+            "coarse_mel": coarse_mel,
+            "residual_mel": res_mel,
+            "unit_logits": unit_logits,
+        }

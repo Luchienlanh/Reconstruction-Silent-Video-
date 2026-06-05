@@ -112,7 +112,7 @@ def extract_window(
     else:
         crop_boxes = torch.zeros(end - start, 4)
 
-    return {
+    window = {
         "video": item["video"][:, start:end].float(),
         "landmarks": item["landmarks"][start:end].float(),
         "mel": item["mel"][mel_idx].float(),
@@ -129,6 +129,10 @@ def extract_window(
         "mel_indices": mel_idx.long(),
         "clip_index": int(clip_index),
     }
+    if "speech_units" in item:
+        window["speech_units"] = item["speech_units"][mel_idx].long()
+        window["num_speech_units"] = int(item.get("num_speech_units", int(window["speech_units"].max().item()) + 1))
+    return window
 
 
 class WindowedMelDataset(Dataset):
@@ -230,6 +234,12 @@ def _pad_bool(x: torch.Tensor, length: int) -> torch.Tensor:
     return F.pad(x, (0, length - x.shape[0]), value=False)
 
 
+def _pad_long(x: torch.Tensor, length: int, value: int = -100) -> torch.Tensor:
+    if x.shape[0] == length:
+        return x
+    return F.pad(x, (0, length - x.shape[0]), value=value)
+
+
 def collate_windows(batch: list[dict[str, Any]]) -> dict[str, Any]:
     video_lengths = torch.tensor([b["video_len"] for b in batch], dtype=torch.long)
     mel_lengths = torch.tensor([b["mel_len"] for b in batch], dtype=torch.long)
@@ -245,7 +255,7 @@ def collate_windows(batch: list[dict[str, Any]]) -> dict[str, Any]:
 
     video_mask = torch.arange(max_video).unsqueeze(0) < video_lengths.unsqueeze(1)
     mel_mask = torch.arange(max_mel).unsqueeze(0) < mel_lengths.unsqueeze(1)
-    return {
+    out = {
         "video": video,
         "landmarks": landmarks,
         "mel": mel,
@@ -262,3 +272,8 @@ def collate_windows(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "window_ends": torch.tensor([b["window_end"] for b in batch], dtype=torch.long),
         "clip_indices": torch.tensor([b["clip_index"] for b in batch], dtype=torch.long),
     }
+    if all("speech_units" in b for b in batch):
+        out["speech_units"] = torch.stack([_pad_long(b["speech_units"], max_mel, value=-100) for b in batch], dim=0)
+        out["speech_unit_mask"] = mel_mask.clone()
+        out["num_speech_units"] = max(int(b.get("num_speech_units", 0)) for b in batch)
+    return out

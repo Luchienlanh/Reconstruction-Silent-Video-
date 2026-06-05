@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from srcV4.data import WindowedMelDataset, collate_windows, split_cache_files
-from srcV4.models import V4MelLoss, V4SpeechModel, masked_stats
+from srcV4.models import V4MelLoss, V4SpeechModel, masked_stats, speech_unit_loss, unit_frame_accuracy
 from srcV4.utils import batch_to_device, get_device, seed_everything, unwrap_model, write_json
 
 
@@ -20,6 +20,30 @@ def parse_layers(value: str) -> tuple[int, int, int, int]:
     if len(parts) != 4:
         raise argparse.ArgumentTypeError("resnet layers must look like 1,1,1,1 or 2,2,2,2")
     return tuple(parts)  # type: ignore[return-value]
+
+
+def infer_num_units(files: list[Path]) -> int:
+    for path in files:
+        item = torch.load(path, map_location="cpu", weights_only=False)
+        if "num_speech_units" in item:
+            return int(item["num_speech_units"])
+        if "speech_units" in item:
+            units = item["speech_units"].long()
+            valid = units[units.ge(0)]
+            if valid.numel():
+                return int(valid.max().item()) + 1
+    return 0
+
+
+def teacher_prob_for_epoch(args: argparse.Namespace, epoch: int) -> float:
+    start = float(args.unit_teacher_prob)
+    if not args.use_content_units or start <= 0:
+        return 0.0
+    decay = int(args.unit_teacher_decay_epochs)
+    if decay <= 0:
+        return start
+    progress = min(1.0, max(0.0, (epoch - 1) / float(decay)))
+    return max(float(args.unit_teacher_min), start * (1.0 - progress))
 
 
 def make_loader(
@@ -107,6 +131,9 @@ def build_model(args: argparse.Namespace, device: torch.device, mel_mean: torch.
         siren_layers=args.siren_layers,
         siren_omega=args.siren_omega,
         visual_encoder_type=args.visual_encoder_type,
+        use_content_units=args.use_content_units,
+        num_units=args.num_units,
+        unit_teacher_prob=args.unit_teacher_prob,
     ).to(device)
     
     if mel_mean is not None:
@@ -151,6 +178,13 @@ def make_optimizer(model: torch.nn.Module, args: argparse.Namespace) -> torch.op
     fusion_params = list(raw.fusion.parameters())
     decoder_params = list(raw.decoder.parameters())
     siren_params = list(raw.siren_residual.parameters())
+    content_params = []
+    if getattr(raw, "use_content_units", False):
+        content_params = (
+            list(raw.unit_head.parameters())
+            + list(raw.unit_embedding.parameters())
+            + list(raw.content_fusion.parameters())
+        )
     
     param_groups = [
         {"params": visual_params, "lr": args.visual_lr or args.lr * 0.3},
@@ -159,6 +193,8 @@ def make_optimizer(model: torch.nn.Module, args: argparse.Namespace) -> torch.op
         {"params": decoder_params, "lr": args.decoder_lr or args.lr * 1.5},
         {"params": siren_params, "lr": args.siren_lr or args.lr * 0.5},
     ]
+    if content_params:
+        param_groups.append({"params": content_params, "lr": args.unit_lr or args.lr})
     
     if args.use_snn:
         snn_params = list(raw.snn.parameters())
@@ -227,16 +263,19 @@ def set_visual_trainable(model: torch.nn.Module, trainable: bool) -> None:
         raw.visual.eval()
 
 
-def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, device, args, epoch: int) -> float:
+def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, device, args, epoch: int) -> dict[str, float]:
     model.train()
     if hasattr(loader.dataset, "resample_windows"):
         loader.dataset.resample_windows(epoch)
         
     freeze_visual = epoch <= args.freeze_visual_epochs
     set_visual_trainable(model, not freeze_visual)
+    raw_model = unwrap_model(model)
+    if hasattr(raw_model, "unit_teacher_prob"):
+        raw_model.unit_teacher_prob = teacher_prob_for_epoch(args, epoch)
     
     amp_enabled = device.type == "cuda" and args.amp
-    total = 0.0
+    totals = {"loss": 0.0, "mel": 0.0, "unit": 0.0, "unit_acc": 0.0}
     count = 0
     for batch in tqdm(loader, desc="train", leave=False):
         batch = sanitize_batch(batch_to_device(batch, device))
@@ -255,10 +294,14 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, devi
             unwrap_model(model).visual.eval()
             
         with torch.amp.autocast("cuda", enabled=amp_enabled):
-            pred = model(batch, target_len=batch["mel"].shape[1])
+            outputs = model(batch, target_len=batch["mel"].shape[1], return_aux=args.use_content_units)
+            pred = outputs["mel"] if isinstance(outputs, dict) else outputs
             
         with torch.amp.autocast("cuda", enabled=False):
-            loss = criterion(pred.float(), batch["mel"].float(), batch["mel_mask"])
+            mel_loss = criterion(pred.float(), batch["mel"].float(), batch["mel_mask"])
+            unit_logits = outputs.get("unit_logits") if isinstance(outputs, dict) else None
+            unit_loss = speech_unit_loss(unit_logits, batch, label_smoothing=args.unit_label_smoothing)
+            loss = mel_loss + float(args.unit_loss_weight) * unit_loss
             
         if not torch.isfinite(loss):
             paths = batch.get("paths", [])[:4]
@@ -273,11 +316,17 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, devi
         scaler.step(optimizer)
         scaler.update()
         
-        total += float(loss.detach().cpu())
+        totals["loss"] += float(loss.detach().cpu())
+        totals["mel"] += float(mel_loss.detach().cpu())
+        totals["unit"] += float(unit_loss.detach().cpu())
+        totals["unit_acc"] += unit_frame_accuracy(unit_logits, batch)
         count += 1
         
     scheduler.step()
-    return total / max(1, count)
+    denom = max(1, count)
+    out = {key: value / denom for key, value in totals.items()}
+    out["teacher_prob"] = float(getattr(raw_model, "unit_teacher_prob", 0.0))
+    return out
 
 
 @torch.no_grad()
@@ -288,13 +337,20 @@ def evaluate(model, loader, criterion, device, args) -> tuple[float, dict[str, f
     stats = {}
     for batch in tqdm(loader, desc="eval", leave=False):
         batch = sanitize_batch(batch_to_device(batch, device))
-        pred = model(batch, target_len=batch["mel"].shape[1])
+        outputs = model(batch, target_len=batch["mel"].shape[1], return_aux=args.use_content_units)
+        pred = outputs["mel"] if isinstance(outputs, dict) else outputs
         pred = torch.nan_to_num(pred.float(), nan=0.0, posinf=20.0, neginf=-20.0)
-        loss = criterion(pred, batch["mel"].float(), batch["mel_mask"])
+        mel_loss = criterion(pred, batch["mel"].float(), batch["mel_mask"])
+        unit_logits = outputs.get("unit_logits") if isinstance(outputs, dict) else None
+        unit_loss = speech_unit_loss(unit_logits, batch, label_smoothing=args.unit_label_smoothing)
+        loss = mel_loss + float(args.unit_loss_weight) * unit_loss
         total += float(loss.detach().cpu())
         count += 1
         if not stats:
             stats = masked_stats(pred, batch["mel"], batch["mel_mask"])
+            stats["mel_loss"] = float(mel_loss.detach().cpu())
+            stats["unit_loss"] = float(unit_loss.detach().cpu())
+            stats["unit_acc"] = unit_frame_accuracy(unit_logits, batch)
     return total / max(1, count), stats
 
 
@@ -330,6 +386,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder-lr", type=float, default=0.0)
     parser.add_argument("--siren-lr", type=float, default=0.0)
     parser.add_argument("--snn-lr", type=float, default=0.0)
+    parser.add_argument("--unit-lr", type=float, default=0.0)
     
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -342,6 +399,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-energy", type=float, default=0.02)
     parser.add_argument("--lambda-mr-spectral", type=float, default=0.25)
     parser.add_argument("--shift-window", type=int, default=0)
+
+    # Optional V2-style content unit bottleneck
+    parser.add_argument("--use-content-units", action="store_true")
+    parser.add_argument("--num-units", type=int, default=0)
+    parser.add_argument("--unit-loss-weight", type=float, default=0.25)
+    parser.add_argument("--unit-label-smoothing", type=float, default=0.05)
+    parser.add_argument("--unit-teacher-prob", type=float, default=0.5)
+    parser.add_argument("--unit-teacher-decay-epochs", type=int, default=20)
+    parser.add_argument("--unit-teacher-min", type=float, default=0.05)
     
     # SNN arguments
     parser.add_argument("--use-snn", action="store_true", help="Enable LIF Spiking Neural Network temporal processor.")
@@ -381,6 +447,11 @@ def run(args: argparse.Namespace) -> None:
 
     limit_files = args.limit_files if args.limit_files > 0 else None
     train_files, val_files = split_cache_files(args.data_dir, args.val_ratio, args.seed, limit_files=limit_files)
+    if args.use_content_units and args.num_units <= 0:
+        args.num_units = infer_num_units(train_files)
+        if args.num_units <= 0:
+            print("[content-units] no speech_units found and --num-units was not set; disabling content units")
+            args.use_content_units = False
     
     train_loader = make_loader(
         args.data_dir,
@@ -449,14 +520,15 @@ def run(args: argparse.Namespace) -> None:
     print(f"[device] {device}")
     print(f"[data] files train={len(train_files)} val={len(val_files)} windows train={len(train_loader.dataset)}")
     print(f"[window] frames={args.window_frames} hop={args.hop_frames}")
-    print(f"[model] visual={args.visual_encoder_type} decoder=TFiLM-Conformer SIREN=Residual SNN={'Enabled' if args.use_snn else 'Disabled'}")
+    content_txt = f"ContentUnits={args.num_units}" if args.use_content_units else "ContentUnits=Disabled"
+    print(f"[model] visual={args.visual_encoder_type} decoder=TFiLM-Conformer SIREN=Residual SNN={'Enabled' if args.use_snn else 'Disabled'} {content_txt}")
     print(f"[baseline] mean_train={mean_train:.6f} mean_val={mean_val if mean_val is not None else 'n/a'}")
 
     history = []
     best = float("inf")
     for epoch in range(1, args.epochs + 1):
         current_lr = optimizer.param_groups[1]["lr"]  # Get landmark LR as reference
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, device, args, epoch)
+        train_metrics = train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, device, args, epoch)
         train_eval, train_stats = evaluate(model, stats_loader, criterion, device, args)
         
         val_loss = None
@@ -475,7 +547,11 @@ def run(args: argparse.Namespace) -> None:
         
         row = {
             "epoch": epoch,
-            "train": train_loss,
+            "train": train_metrics["loss"],
+            "train_mel": train_metrics["mel"],
+            "train_unit": train_metrics["unit"],
+            "train_unit_acc": train_metrics["unit_acc"],
+            "unit_teacher_prob": train_metrics.get("teacher_prob", 0.0),
             "train_eval": train_eval,
             "val": val_loss,
             "best": best,
@@ -488,9 +564,18 @@ def run(args: argparse.Namespace) -> None:
         val_txt = f"{val_loss:.6f}" if val_loss is not None else "n/a"
         std_r = train_stats.get("std_ratio", 0.0)
         del_r = train_stats.get("delta_ratio", 0.0)
+        unit_txt = ""
+        if args.use_content_units:
+            unit_txt = (
+                f" unit={train_metrics['unit']:.4f} unit_acc={train_metrics['unit_acc']:.3f}"
+                f" teacher={train_metrics.get('teacher_prob', 0.0):.2f}"
+            )
+            if val_stats:
+                unit_txt += f" val_unit={val_stats.get('unit_loss', 0.0):.4f} val_acc={val_stats.get('unit_acc', 0.0):.3f}"
         tag = " best" if is_best else ""
         print(
-            f"[epoch {epoch:04d}] lr={current_lr:.6f} train={train_loss:.6f} train_eval={train_eval:.6f} "
+            f"[epoch {epoch:04d}] lr={current_lr:.6f} train={train_metrics['loss']:.6f} "
+            f"mel={train_metrics['mel']:.6f}{unit_txt} train_eval={train_eval:.6f} "
             f"val={val_txt} best={best:.6f} std_r={std_r:.3f} del_r={del_r:.3f}{tag}"
         )
 

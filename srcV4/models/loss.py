@@ -163,6 +163,50 @@ class V4MelLoss(nn.Module):
         return loss
 
 
+def speech_unit_loss(
+    unit_logits: torch.Tensor | None,
+    batch: dict,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    if unit_logits is None or "speech_units" not in batch:
+        if unit_logits is not None:
+            return unit_logits.new_tensor(0.0)
+        mel = batch.get("mel")
+        if torch.is_tensor(mel):
+            return mel.new_tensor(0.0)
+        return torch.tensor(0.0)
+    logits = torch.nan_to_num(unit_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+    targets = batch["speech_units"].to(logits.device).long()
+    if targets.shape[1] != logits.shape[1]:
+        targets = F.interpolate(targets.float().unsqueeze(1), size=logits.shape[1], mode="nearest").squeeze(1).long()
+    if "mel_mask" in batch and batch["mel_mask"].shape[1] == targets.shape[1]:
+        valid = batch["mel_mask"].to(logits.device, dtype=torch.bool) & targets.ge(0)
+        targets = targets.masked_fill(~valid, -100)
+    return F.cross_entropy(
+        logits.transpose(1, 2),
+        targets,
+        ignore_index=-100,
+        label_smoothing=float(label_smoothing),
+    )
+
+
+@torch.no_grad()
+def unit_frame_accuracy(unit_logits: torch.Tensor | None, batch: dict) -> float:
+    if unit_logits is None or "speech_units" not in batch:
+        return 0.0
+    logits = torch.nan_to_num(unit_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+    targets = batch["speech_units"].to(logits.device).long()
+    if targets.shape[1] != logits.shape[1]:
+        targets = F.interpolate(targets.float().unsqueeze(1), size=logits.shape[1], mode="nearest").squeeze(1).long()
+    valid = targets.ge(0)
+    if "mel_mask" in batch and batch["mel_mask"].shape[1] == targets.shape[1]:
+        valid = valid & batch["mel_mask"].to(logits.device, dtype=torch.bool)
+    if not bool(valid.any()):
+        return 0.0
+    pred = logits.argmax(dim=-1)
+    return float((pred.eq(targets) & valid).float().sum().div(valid.float().sum().clamp_min(1.0)).detach().cpu())
+
+
 @torch.no_grad()
 def masked_stats(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
     mask = mask.to(pred.device, dtype=torch.bool)
