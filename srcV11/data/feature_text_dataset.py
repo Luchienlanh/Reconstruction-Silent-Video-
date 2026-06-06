@@ -11,8 +11,15 @@ from torch.utils.data import Dataset
 from .text import CHAR_EN_VOCAB, normalize_english, text_to_ids
 
 
+def torch_load_cpu(path: str | Path) -> dict[str, Any]:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
 def load_feature_cache(path: str | Path) -> dict[str, Any]:
-    item = torch.load(path, map_location="cpu", weights_only=False)
+    item = torch_load_cpu(path)
     if item.get("format") != "avhubert_feature_v1":
         raise ValueError(f"{path} is not an avhubert_feature_v1 file.")
     return item
