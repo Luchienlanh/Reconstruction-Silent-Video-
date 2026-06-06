@@ -73,12 +73,17 @@ class AVHubertVisualFeatureExtractor(nn.Module):
                 name == "fairseq"
                 or name.startswith("fairseq.")
                 or name in {"hubert", "hubert_pretraining"}
+                or name == "avhubert"
                 or name.startswith("avhubert.")
             ):
                 del sys.modules[name]
         importlib.invalidate_caches()
 
+        added_debug_argv = False
         try:
+            if len(sys.argv) == 1:
+                sys.argv.append("__avhubert_import__")
+                added_debug_argv = True
             import fairseq  # type: ignore
             fairseq_file = getattr(fairseq, "__file__", None)
             if fairseq_file is None:
@@ -86,10 +91,9 @@ class AVHubertVisualFeatureExtractor(nn.Module):
                     "Imported fairseq as a namespace package, not the real package. "
                     f"Expected package under {fairseq_pkg}."
                 )
-            import hubert_pretraining  # noqa: F401
-            import hubert  # noqa: F401
+            import avhubert.hubert_pretraining as hubert_pretraining_pkg  # noqa: F401
+            sys.modules["hubert_pretraining"] = hubert_pretraining_pkg
             import avhubert.hubert  # noqa: F401
-            import avhubert.hubert_pretraining  # noqa: F401
         except Exception as exc:
             raise RuntimeError(
                 "Could not import AV-HuBERT/fairseq. Use Python 3.8 for the official "
@@ -98,6 +102,9 @@ class AVHubertVisualFeatureExtractor(nn.Module):
                 "the fairseq submodule, and av_hubert/avhubert. On Python 3.11+ this old "
                 "fairseq often fails."
             ) from exc
+        finally:
+            if added_debug_argv and sys.argv[-1] == "__avhubert_import__":
+                sys.argv.pop()
 
         models, _cfg, _task = fairseq.checkpoint_utils.load_model_ensemble_and_task([str(ckpt)])
         model = models[0]
