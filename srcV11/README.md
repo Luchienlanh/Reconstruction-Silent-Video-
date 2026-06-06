@@ -43,6 +43,8 @@ $PY -m srcV8.training.cache_avhubert_features \
   --limit-files 1000 \
   --batch-size 1 \
   --device cuda \
+  --normalize-mode avhubert \
+  --crop-size 88 \
   --amp
 ```
 
@@ -58,6 +60,12 @@ Then use that checkpoint in the cache command:
 
 ```bash
 CKPT=/kaggle/working/pretrained/avhubert/base_vox_vsr_433h.pt
+```
+
+Do not reuse feature caches made with older per-frame normalization. Use a new output directory, for example:
+
+```bash
+--output-dir /kaggle/working/Processed_Data_AVHubertFeatures_VSR88_LRS2
 ```
 
 ## 2. Smoke Train
