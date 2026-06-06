@@ -60,6 +60,9 @@ python -m srcV11.training.train_ctc \
 
 ## 3. Train
 
+After AV-HuBERT feature caching, train CTC with the normal Kaggle Python runtime.
+The Python 3.8 AV-HuBERT env is only needed for feature extraction.
+
 ```bash
 python -m srcV11.training.train_ctc \
   --feature-dir Processed_Data_NativeFeatures_LRS2_10k \

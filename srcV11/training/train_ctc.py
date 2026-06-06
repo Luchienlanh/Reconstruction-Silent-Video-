@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import sys
 from pathlib import Path
@@ -28,6 +29,41 @@ from srcV11.models import LipTextCTCModel
 from srcV11.utils import batch_to_device, get_device, seed_everything, unwrap_model, write_json
 
 
+def cuda_bf16_supported() -> bool:
+    fn = getattr(torch.cuda, "is_bf16_supported", None)
+    return bool(fn is not None and fn())
+
+
+def cuda_autocast(enabled: bool, dtype: torch.dtype):
+    if not enabled:
+        return nullcontext()
+    amp = getattr(torch, "amp", None)
+    if amp is not None and hasattr(amp, "autocast"):
+        return amp.autocast("cuda", enabled=True, dtype=dtype)
+    return torch.cuda.amp.autocast(enabled=True, dtype=dtype)
+
+
+def make_grad_scaler(enabled: bool):
+    amp = getattr(torch, "amp", None)
+    if amp is not None and hasattr(amp, "GradScaler"):
+        try:
+            return amp.GradScaler("cuda", enabled=enabled)
+        except TypeError:
+            return amp.GradScaler(enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def add_boolean_arg(parser: argparse.ArgumentParser, name: str, default: bool, help: str | None = None) -> None:
+    if hasattr(argparse, "BooleanOptionalAction"):
+        parser.add_argument(name, action=argparse.BooleanOptionalAction, default=default, help=help)
+        return
+    dest = name.lstrip("-").replace("-", "_")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(name, dest=dest, action="store_true", help=help)
+    group.add_argument(f"--no-{name.lstrip('-')}", dest=dest, action="store_false", help=argparse.SUPPRESS)
+    parser.set_defaults(**{dest: default})
+
+
 def configure_amp(args: argparse.Namespace, device: torch.device) -> None:
     args.amp_enabled = False
     args.amp_resolved_dtype = "off"
@@ -35,7 +71,7 @@ def configure_amp(args: argparse.Namespace, device: torch.device) -> None:
     if device.type != "cuda" or not args.amp:
         return
     requested = str(args.amp_dtype).lower()
-    bf16_supported = bool(torch.cuda.is_bf16_supported())
+    bf16_supported = cuda_bf16_supported()
     if requested in {"auto", "bf16"} and bf16_supported:
         args.amp_enabled = True
         args.amp_resolved_dtype = "bf16"
@@ -98,7 +134,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, args) -
     count = 0
 
     def forward_loss(batch: dict, use_amp: bool) -> tuple[torch.Tensor, torch.Tensor, bool]:
-        with torch.amp.autocast("cuda", enabled=use_amp, dtype=autocast_dtype):
+        with cuda_autocast(use_amp, autocast_dtype):
             logits = model(batch["features"], batch["feature_mask"])
         loss = ctc_loss(logits, batch, raw, criterion)
         return logits, loss, logits_are_finite(logits)
@@ -236,8 +272,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--amp-dtype", choices=["auto", "bf16", "fp16"], default="auto")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--multi-gpu", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--eval-train", action=argparse.BooleanOptionalAction, default=True)
+    add_boolean_arg(parser, "--multi-gpu", default=True)
+    add_boolean_arg(parser, "--eval-train", default=True)
     parser.add_argument("--print-samples", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -280,7 +316,7 @@ def run(args: argparse.Namespace) -> None:
         model = torch.nn.DataParallel(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.98))
     criterion = torch.nn.CTCLoss(blank=0, zero_infinity=True)
-    scaler = torch.amp.GradScaler("cuda", enabled=bool(getattr(args, "amp_scaler_enabled", False)))
+    scaler = make_grad_scaler(bool(getattr(args, "amp_scaler_enabled", False)))
 
     print(f"[device] {device}")
     print(f"[amp] enabled={args.amp_enabled} dtype={args.amp_resolved_dtype} scaler={args.amp_scaler_enabled}")
