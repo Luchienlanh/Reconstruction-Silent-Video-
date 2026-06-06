@@ -61,6 +61,8 @@ def run(args: argparse.Namespace) -> None:
         output_layer=args.output_layer if args.output_layer > 0 else None,
         freeze=True,
         normalize_video=not args.no_normalize_video,
+        normalize_mode="none" if args.no_normalize_video else args.normalize_mode,
+        crop_size=args.crop_size,
     ).to(device)
     extractor.eval()
 
@@ -68,6 +70,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"[data] {args.data_dir} files={len(ds)}")
     print(f"[avhubert] dir={args.avhubert_dir}")
     print(f"[checkpoint] {args.checkpoint}")
+    print(f"[preprocess] crop_size={args.crop_size} normalize={extractor.normalize_mode}")
     print(f"[output] {output_dir}")
 
     written = 0
@@ -101,6 +104,10 @@ def run(args: argparse.Namespace) -> None:
                     "source_video": batch["source_videos"][i],
                     "avhubert_checkpoint": str(args.checkpoint),
                     "output_layer": args.output_layer,
+                    "preprocess": {
+                        "crop_size": int(args.crop_size),
+                        "normalize_mode": str(extractor.normalize_mode),
+                    },
                 },
                 out_path,
             )
@@ -123,6 +130,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-normalize-video", action="store_true")
+    parser.add_argument(
+        "--normalize-mode",
+        choices=["avhubert", "per_frame", "none"],
+        default="avhubert",
+        help="Video normalization before AV-HuBERT. Use avhubert for official VSR/pretrained checkpoints.",
+    )
+    parser.add_argument("--crop-size", type=int, default=88, help="Center crop size after resizing mouth ROI to 96.")
     return parser.parse_args()
 
 

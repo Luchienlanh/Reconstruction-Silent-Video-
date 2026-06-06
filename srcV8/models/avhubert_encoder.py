@@ -23,12 +23,15 @@ class AVHubertVisualFeatureExtractor(nn.Module):
         output_layer: int | None = None,
         freeze: bool = True,
         normalize_video: bool = True,
+        normalize_mode: str | None = None,
+        crop_size: int = 88,
     ):
         super().__init__()
         self.checkpoint = str(checkpoint)
         self.avhubert_dir = str(avhubert_dir)
         self.output_layer = output_layer
-        self.normalize_video = bool(normalize_video)
+        self.normalize_mode = (normalize_mode or ("avhubert" if normalize_video else "none")).lower()
+        self.crop_size = int(crop_size)
         self.model = self._load_model(self.checkpoint, self.avhubert_dir)
         self.model.eval()
         if freeze:
@@ -132,15 +135,32 @@ class AVHubertVisualFeatureExtractor(nn.Module):
         flat = F.interpolate(flat, size=(size, size), mode="bilinear", align_corners=False)
         return flat.reshape(b, t, c, size, size).permute(0, 2, 1, 3, 4).contiguous()
 
+    @staticmethod
+    def _center_crop_video(video: torch.Tensor, size: int = 88) -> torch.Tensor:
+        h, w = video.shape[-2:]
+        if (h, w) == (size, size):
+            return video
+        if h < size or w < size:
+            return AVHubertVisualFeatureExtractor._resize_video(video, size)
+        top = (h - size) // 2
+        left = (w - size) // 2
+        return video[..., top : top + size, left : left + size].contiguous()
+
     def _prepare_video(self, video: torch.Tensor) -> torch.Tensor:
         video = self._resize_video(video.float(), 96)
-        if self.normalize_video:
-            # AV-HuBERT recipes use normalized mouth ROI. Our cache is already
-            # usually in 0..1; this standardization avoids dataset-level scale drift.
+        video = self._center_crop_video(video, self.crop_size)
+        if video.detach().amax().item() > 2.0:
+            video = video / 255.0
+        if self.normalize_mode in {"none", "off", "false", "0"}:
+            return video
+        if self.normalize_mode in {"avhubert", "official"}:
+            return (video - 0.421) / 0.165
+        if self.normalize_mode in {"per_frame", "per-sample", "per_sample", "sample"}:
             mean = video.mean(dim=(-1, -2), keepdim=True)
             std = video.std(dim=(-1, -2), keepdim=True, unbiased=False).clamp_min(1e-4)
             video = (video - mean) / std
-        return video
+            return video
+        raise ValueError(f"Unsupported normalize_mode={self.normalize_mode}")
 
     @torch.no_grad()
     def forward(self, video: torch.Tensor, video_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
