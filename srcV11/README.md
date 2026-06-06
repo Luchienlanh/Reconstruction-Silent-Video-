@@ -135,3 +135,47 @@ $PY -m srcV11.inference.infer_avhubert_official \
   --beam 20 \
   --device cuda
 ```
+
+For dataset audit, evaluate a split and build clean manifests:
+
+```bash
+PY=/kaggle/working/envs/avhubert38/bin/python
+REPO=/kaggle/working/Reconstruction-Silent-Video-
+AVH=/kaggle/working/av_hubert
+CKPT=/kaggle/working/pretrained/avhubert/base_vox_vsr_433h.pt
+
+PYTHONPATH=$AVH/avhubert:$AVH:$AVH/fairseq:$REPO \
+$PY -u -m srcV11.inference.eval_avhubert_official \
+  --feature-dir /kaggle/working/Processed_Data_AVHubertFeatures_VSR88_LRS2_full \
+  --avhubert-dir $AVH \
+  --checkpoint $CKPT \
+  --output-dir /kaggle/working/eval_official_vsr_train \
+  --split train \
+  --max-samples 0 \
+  --beam 20 \
+  --device cuda
+
+python -u -m srcV11.data.filter_vsr_eval \
+  --eval-json /kaggle/working/eval_official_vsr_train/official_vsr_eval.json \
+  --output-dir /kaggle/working/vsr_filter_train \
+  --clean-cer 0.20 \
+  --clean-wer 0.35
+```
+
+Then train on clean or usable manifests:
+
+```bash
+python -u -m srcV11.training.train_ctc \
+  --feature-dir /kaggle/working/Processed_Data_AVHubertFeatures_VSR88_LRS2_full \
+  --train-manifest /kaggle/working/vsr_filter_train/usable_manifest.txt \
+  --output-dir /kaggle/working/checkpoints_srcV11_vsr88_usable \
+  --epochs 40 \
+  --batch-size 16 \
+  --dim 256 \
+  --tcn-layers 2 \
+  --transformer-layers 2 \
+  --dropout 0.35 \
+  --weight-decay 0.01 \
+  --lr 1e-4 \
+  --no-eval-train
+```

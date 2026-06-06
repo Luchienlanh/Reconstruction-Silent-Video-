@@ -123,6 +123,41 @@ def make_loader(args: argparse.Namespace, files: list[Path], batch_size: int, sh
     )
 
 
+def read_manifest(path: str | Path) -> list[Path]:
+    manifest = Path(path)
+    files = []
+    for raw in manifest.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        files.append(Path(line))
+    if not files:
+        raise RuntimeError(f"Manifest is empty: {manifest}")
+    return files
+
+
+def train_val_files(args: argparse.Namespace) -> tuple[list[Path], list[Path]]:
+    if args.train_manifest:
+        train_files = read_manifest(args.train_manifest)
+        if args.val_manifest:
+            val_files = read_manifest(args.val_manifest)
+        else:
+            _unused_train, val_files = split_feature_files(
+                args.feature_dir,
+                val_ratio=args.val_ratio,
+                seed=args.seed,
+                limit_files=args.limit_files if args.limit_files > 0 else None,
+            )
+        return train_files, val_files
+
+    return split_feature_files(
+        args.feature_dir,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+        limit_files=args.limit_files if args.limit_files > 0 else None,
+    )
+
+
 def ctc_loss(logits: torch.Tensor, batch: dict, model: LipTextCTCModel, criterion: torch.nn.CTCLoss) -> torch.Tensor:
     log_probs = F.log_softmax(logits.float(), dim=-1).transpose(0, 1).contiguous()
     input_lengths = model.output_lengths(batch["feature_lengths"].to(log_probs.device)).clamp_max(log_probs.shape[0])
@@ -263,6 +298,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train srcV11 lip-to-text CTC on cached AV-HuBERT features.")
     parser.add_argument("--feature-dir", "--data-dir", dest="feature_dir", default="Processed_Data_AVHubertFeatures_LRS2_10k")
     parser.add_argument("--output-dir", default="checkpoints_srcV11_lrs2_char_ctc")
+    parser.add_argument("--train-manifest", default="", help="Optional text file with one training feature path per line.")
+    parser.add_argument("--val-manifest", default="", help="Optional text file with one validation feature path per line.")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--val-batch-size", type=int, default=0)
@@ -297,12 +334,7 @@ def run(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_files, val_files = split_feature_files(
-        args.feature_dir,
-        val_ratio=args.val_ratio,
-        seed=args.seed,
-        limit_files=args.limit_files if args.limit_files > 0 else None,
-    )
+    train_files, val_files = train_val_files(args)
     train_loader = make_loader(args, train_files, args.batch_size, shuffle=True)
     val_loader = (
         make_loader(args, val_files, args.val_batch_size or args.batch_size, shuffle=False)
