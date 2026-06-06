@@ -46,23 +46,35 @@ class AVHubertVisualFeatureExtractor(nn.Module):
 
         fairseq_root = avhubert_root / "fairseq"
         fairseq_pkg = fairseq_root / "fairseq"
+        avhubert_pkg = avhubert_root / "avhubert"
+        if not avhubert_pkg.is_dir():
+            raise FileNotFoundError(
+                "AV-HuBERT package dir is missing. Expected: "
+                f"{avhubert_pkg}"
+            )
         if not fairseq_pkg.is_dir():
             raise FileNotFoundError(
                 "AV-HuBERT fairseq submodule is missing. Run: "
                 f"git -C {avhubert_root} submodule update --init --recursive"
             )
 
-        # Put the actual fairseq repo root before av_hubert root. If av_hubert
-        # root comes first, Python may import av_hubert/fairseq as an empty
-        # namespace package and then `from fairseq import utils` fails.
-        for candidate in (avhubert_root, fairseq_root):
+        # Official AV-HuBERT uses old absolute imports inside avhubert/*.py
+        # such as `from hubert_pretraining import ...`, so both the repo root
+        # and the avhubert package directory need to be importable.
+        for candidate in (avhubert_root, avhubert_pkg, fairseq_root):
             text = str(candidate)
             while text in sys.path:
                 sys.path.remove(text)
         sys.path.insert(0, str(avhubert_root))
+        sys.path.insert(0, str(avhubert_pkg))
         sys.path.insert(0, str(fairseq_root))
         for name in list(sys.modules):
-            if name == "fairseq" or name.startswith("fairseq."):
+            if (
+                name == "fairseq"
+                or name.startswith("fairseq.")
+                or name in {"hubert", "hubert_pretraining"}
+                or name.startswith("avhubert.")
+            ):
                 del sys.modules[name]
         importlib.invalidate_caches()
 
@@ -74,13 +86,17 @@ class AVHubertVisualFeatureExtractor(nn.Module):
                     "Imported fairseq as a namespace package, not the real package. "
                     f"Expected package under {fairseq_pkg}."
                 )
+            import hubert_pretraining  # noqa: F401
+            import hubert  # noqa: F401
             import avhubert.hubert  # noqa: F401
             import avhubert.hubert_pretraining  # noqa: F401
         except Exception as exc:
             raise RuntimeError(
                 "Could not import AV-HuBERT/fairseq. Use Python 3.8 for the official "
                 "AV-HuBERT/fairseq stack, initialize the fairseq submodule, and install "
-                "the AV-HuBERT dependencies. On Python 3.11 this old fairseq often fails."
+                "the AV-HuBERT dependencies. Make sure PYTHONPATH includes the repo root, "
+                "the fairseq submodule, and av_hubert/avhubert. On Python 3.11+ this old "
+                "fairseq often fails."
             ) from exc
 
         models, _cfg, _task = fairseq.checkpoint_utils.load_model_ensemble_and_task([str(ckpt)])
