@@ -25,6 +25,27 @@ This fallback does not need `av_hubert`, `fairseq`, or Python 3.8. It is weaker 
 
 Use this later on a Python/fairseq environment that supports the official AV-HuBERT stack.
 
+On Kaggle, if the AV-HuBERT repo is at `/kaggle/working/av_hubert` and the Python 3.8 env is at
+`/kaggle/working/envs/avhubert38`, include the inner `avhubert` directory in `PYTHONPATH`:
+
+```bash
+PY=/kaggle/working/envs/avhubert38/bin/python
+REPO=/kaggle/working/Reconstruction-Silent-Video-
+AVH=/kaggle/working/av_hubert
+CKPT=/kaggle/working/pretrained/avhubert/base_vox_iter5.pt
+
+PYTHONPATH=$AVH/avhubert:$AVH:$AVH/fairseq:$REPO \
+$PY -m srcV8.training.cache_avhubert_features \
+  --data-dir /kaggle/input/datasets/ludocute/antirs/Processed_Data_R2INR_LRS2_10k \
+  --output-dir /kaggle/working/Processed_Data_AVHubertFeatures_LRS2_1k \
+  --avhubert-dir $AVH \
+  --checkpoint $CKPT \
+  --limit-files 1000 \
+  --batch-size 1 \
+  --device cuda \
+  --amp
+```
+
 ## 2. Smoke Train
 
 ```bash
