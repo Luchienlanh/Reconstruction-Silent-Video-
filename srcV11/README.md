@@ -8,6 +8,58 @@ The main goal is accessibility-friendly text/subtitle output. Audio should be ad
 silent video -> srcV11 text -> fixed MC/native-speaker TTS -> wav
 ```
 
+## 0. Quick Start: Local Visual-Only System
+
+This path runs on the existing `Processed_Data_R2INR_LRS2_10k` cache and does not need AV-HuBERT, fairseq, or a downloaded checkpoint.
+It is a practical baseline: each mouth frame becomes a deterministic feature made from the resized mouth crop plus lip landmarks, then a CTC model predicts text.
+
+```bash
+python -m srcV11.training.cache_visual_features \
+  --data-dir Processed_Data_R2INR_LRS2_10k \
+  --output-dir Processed_Data_VisualFeatures_LRS2_10k \
+  --mouth-size 32 \
+  --overwrite
+
+python -m srcV11.data.build_manifests \
+  --feature-dir Processed_Data_VisualFeatures_LRS2_10k \
+  --output-dir manifests_srcV11_lrs2 \
+  --val-ratio 0.1
+
+python -m srcV11.training.train_ctc \
+  --feature-dir Processed_Data_VisualFeatures_LRS2_10k \
+  --train-manifest manifests_srcV11_lrs2/train_manifest.txt \
+  --val-manifest manifests_srcV11_lrs2/val_manifest.txt \
+  --output-dir checkpoints_srcV11_visual_ctc \
+  --epochs 80 \
+  --batch-size 8 \
+  --dim 384 \
+  --tcn-layers 4 \
+  --transformer-layers 4 \
+  --device cuda
+
+python -m srcV11.inference.eval_ctc \
+  --feature-dir Processed_Data_VisualFeatures_LRS2_10k \
+  --manifest manifests_srcV11_lrs2/val_manifest.txt \
+  --checkpoint checkpoints_srcV11_visual_ctc/best_model.pth \
+  --output-dir eval_srcV11_visual_ctc \
+  --device cuda
+
+python -m srcV11.inference.infer_ctc \
+  --feature-dir Processed_Data_VisualFeatures_LRS2_10k \
+  --feature-file Processed_Data_VisualFeatures_LRS2_10k/main_5535415699068794046_00008_eae933194d.pt \
+  --checkpoint checkpoints_srcV11_visual_ctc/best_model.pth \
+  --output-dir infer_srcV11_visual_ctc \
+  --device cuda
+```
+
+For a CPU smoke test, reduce the run:
+
+```bash
+python -m srcV11.training.cache_visual_features --data-dir Processed_Data_R2INR_LRS2_10k --output-dir tmp_srcV11_visual --limit-files 8 --overwrite
+python -m srcV11.data.build_manifests --feature-dir tmp_srcV11_visual --output-dir tmp_srcV11_manifests
+python -m srcV11.training.train_ctc --feature-dir tmp_srcV11_visual --train-manifest tmp_srcV11_manifests/train_manifest.txt --val-manifest tmp_srcV11_manifests/val_manifest.txt --output-dir tmp_srcV11_ckpt --epochs 1 --batch-size 2 --dim 64 --tcn-layers 1 --transformer-layers 1 --nhead 4 --device cpu
+```
+
 ## 1A. Cache Native Features, No AV-HuBERT
 
 ```bash
