@@ -9,8 +9,15 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
+def torch_load_cpu(path: str | Path) -> dict[str, Any]:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
 def load_text_cache(path: str | Path) -> dict[str, Any]:
-    item = torch.load(path, map_location="cpu", weights_only=False)
+    item = torch_load_cpu(path)
     if item.get("format") not in {"r2inr_text_v1", "r2inr_v1"}:
         raise ValueError(f"{path} is not an r2inr text cache file.")
     if not str(item.get("transcript_text", "")).strip():
@@ -98,4 +105,3 @@ def split_train_val(files: list[Path], val_ratio: float, seed: int) -> tuple[lis
     rng.shuffle(files)
     val_count = max(1, int(round(len(files) * val_ratio))) if len(files) > 1 and val_ratio > 0 else 0
     return sorted(files[val_count:]), sorted(files[:val_count])
-
