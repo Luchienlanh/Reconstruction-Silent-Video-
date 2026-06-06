@@ -114,3 +114,24 @@ Outputs:
 *_predicted_text.txt
 *_confidence.json
 ```
+
+## 5. Official AV-HuBERT VSR Probe
+
+Use this to check whether the official VSR decoder can read the same videos better
+than the small V11 CTC head:
+
+```bash
+PY=/kaggle/working/envs/avhubert38/bin/python
+REPO=/kaggle/working/Reconstruction-Silent-Video-
+AVH=/kaggle/working/av_hubert
+CKPT=/kaggle/working/pretrained/avhubert/base_vox_vsr_433h.pt
+
+PYTHONPATH=$AVH/avhubert:$AVH:$AVH/fairseq:$REPO \
+$PY -m srcV11.inference.infer_avhubert_official \
+  --avhubert-dir $AVH \
+  --checkpoint $CKPT \
+  --feature-file /kaggle/working/Processed_Data_AVHubertFeatures_VSR88_LRS2_6k/sample.pt \
+  --output-dir /kaggle/working/infer_official_vsr \
+  --beam 20 \
+  --device cuda
+```
