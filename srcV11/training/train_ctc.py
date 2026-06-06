@@ -29,6 +29,17 @@ from srcV11.models import LipTextCTCModel
 from srcV11.utils import batch_to_device, get_device, seed_everything, unwrap_model, write_json
 
 
+def progress_bar(iterable, desc: str):
+    return tqdm(
+        iterable,
+        desc=desc,
+        leave=True,
+        dynamic_ncols=True,
+        mininterval=0.5,
+        file=sys.stdout,
+    )
+
+
 def cuda_bf16_supported() -> bool:
     fn = getattr(torch.cuda, "is_bf16_supported", None)
     return bool(fn is not None and fn())
@@ -139,7 +150,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, args) -
         loss = ctc_loss(logits, batch, raw, criterion)
         return logits, loss, logits_are_finite(logits)
 
-    for batch in tqdm(loader, desc="train-ctc", leave=False):
+    for batch in progress_bar(loader, "train-ctc"):
         batch = batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
         logits, loss, finite_logits = forward_loss(batch, amp_enabled)
@@ -188,7 +199,7 @@ def evaluate(model, loader, criterion, device, args) -> dict:
     total_conf = 0.0
     total_count = 0
     samples = []
-    for batch in tqdm(loader, desc="eval-ctc", leave=False):
+    for batch in progress_bar(loader, "eval-ctc"):
         batch = batch_to_device(batch, device)
         logits = model(batch["features"], batch["feature_mask"])
         loss = ctc_loss(logits, batch, raw, criterion)

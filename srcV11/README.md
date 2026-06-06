@@ -46,6 +46,20 @@ $PY -m srcV8.training.cache_avhubert_features \
   --amp
 ```
 
+For lip-to-text, prefer a VSR-finetuned checkpoint over a plain pretraining checkpoint:
+
+```bash
+mkdir -p /kaggle/working/pretrained/avhubert
+wget -c -O /kaggle/working/pretrained/avhubert/base_vox_vsr_433h.pt \
+  https://dl.fbaipublicfiles.com/avhubert/model/lrs3_vox/vsr/base_vox_433h.pt
+```
+
+Then use that checkpoint in the cache command:
+
+```bash
+CKPT=/kaggle/working/pretrained/avhubert/base_vox_vsr_433h.pt
+```
+
 ## 2. Smoke Train
 
 ```bash
