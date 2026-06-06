@@ -32,7 +32,7 @@ class AVHubertVisualFeatureExtractor(nn.Module):
         self.output_layer = output_layer
         self.normalize_mode = (normalize_mode or ("avhubert" if normalize_video else "none")).lower()
         self.crop_size = int(crop_size)
-        self.model = self._load_model(self.checkpoint, self.avhubert_dir)
+        self.model, self.fairseq_cfg, self.fairseq_task = self._load_model_bundle(self.checkpoint, self.avhubert_dir)
         self.model.eval()
         if freeze:
             for param in self.model.parameters():
@@ -40,6 +40,11 @@ class AVHubertVisualFeatureExtractor(nn.Module):
 
     @staticmethod
     def _load_model(checkpoint: str, avhubert_dir: str):
+        model, _cfg, _task = AVHubertVisualFeatureExtractor._load_model_bundle(checkpoint, avhubert_dir)
+        return model
+
+    @staticmethod
+    def _load_model_bundle(checkpoint: str, avhubert_dir: str):
         avhubert_root = Path(avhubert_dir).resolve()
         if not avhubert_root.exists():
             raise FileNotFoundError(f"AV-HuBERT repo dir does not exist: {avhubert_root}")
@@ -110,11 +115,11 @@ class AVHubertVisualFeatureExtractor(nn.Module):
             if added_debug_argv and sys.argv[-1] == "__avhubert_import__":
                 sys.argv.pop()
 
-        models, _cfg, _task = fairseq.checkpoint_utils.load_model_ensemble_and_task([str(ckpt)])
+        models, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task([str(ckpt)])
         model = models[0]
         if hasattr(model, "remove_pretraining_modules"):
             model.remove_pretraining_modules()
-        return model
+        return model, cfg, task
 
     @staticmethod
     def _extract_from_encoder_output(output: dict, tbc: bool) -> tuple[torch.Tensor, torch.Tensor | None]:
