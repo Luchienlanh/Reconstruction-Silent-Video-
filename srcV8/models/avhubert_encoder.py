@@ -94,6 +94,7 @@ class AVHubertVisualFeatureExtractor(nn.Module):
             import avhubert.hubert_pretraining as hubert_pretraining_pkg  # noqa: F401
             sys.modules["hubert_pretraining"] = hubert_pretraining_pkg
             import avhubert.hubert  # noqa: F401
+            import avhubert.hubert_asr  # noqa: F401
         except Exception as exc:
             raise RuntimeError(
                 "Could not import AV-HuBERT/fairseq. Use Python 3.8 for the official "
@@ -111,6 +112,16 @@ class AVHubertVisualFeatureExtractor(nn.Module):
         if hasattr(model, "remove_pretraining_modules"):
             model.remove_pretraining_modules()
         return model
+
+    @staticmethod
+    def _extract_from_encoder_output(output: dict, tbc: bool) -> tuple[torch.Tensor, torch.Tensor | None]:
+        features = output.get("encoder_out")
+        if features is None:
+            raise RuntimeError("AV-HuBERT encoder output did not contain encoder_out.")
+        if tbc:
+            features = features.transpose(0, 1)
+        feature_padding = output.get("encoder_padding_mask", output.get("padding_mask"))
+        return features, feature_padding
 
     @staticmethod
     def _resize_video(video: torch.Tensor, size: int = 96) -> torch.Tensor:
@@ -144,6 +155,12 @@ class AVHubertVisualFeatureExtractor(nn.Module):
                 ret_conv=False,
                 output_layer=self.output_layer,
             )
+        elif hasattr(self.model, "w2v_encoder"):
+            output = self.model.w2v_encoder(source=source, padding_mask=padding_mask, tbc=False)
+            features, feature_padding = self._extract_from_encoder_output(output, tbc=False)
+        elif hasattr(self.model, "encoder"):
+            output = self.model.encoder(source=source, padding_mask=padding_mask)
+            features, feature_padding = self._extract_from_encoder_output(output, tbc=True)
         else:
             features, feature_padding = self.model.extract_features(
                 source,

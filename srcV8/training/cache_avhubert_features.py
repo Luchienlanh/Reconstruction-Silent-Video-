@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import sys
 from pathlib import Path
 
@@ -15,6 +16,15 @@ from tqdm.auto import tqdm
 from srcV8.data.video_dataset import VideoTextDataset, collate_video_text
 from srcV8.models import AVHubertVisualFeatureExtractor
 from srcV8.utils import batch_to_device, get_device, seed_everything
+
+
+def cuda_autocast(enabled: bool):
+    if not enabled:
+        return nullcontext()
+    amp = getattr(torch, "amp", None)
+    if amp is not None and hasattr(amp, "autocast"):
+        return amp.autocast("cuda", enabled=True)
+    return torch.cuda.amp.autocast(enabled=True)
 
 
 def safe_stem(path: str) -> str:
@@ -64,7 +74,7 @@ def run(args: argparse.Namespace) -> None:
     amp_enabled = device.type == "cuda" and args.amp
     for batch in tqdm(loader, desc="cache-avhubert"):
         batch = batch_to_device(batch, device)
-        with torch.amp.autocast("cuda", enabled=amp_enabled):
+        with cuda_autocast(amp_enabled):
             features, feature_padding = extractor(batch["video"], batch["video_mask"])
         if feature_padding is None:
             feature_mask = torch.ones(features.shape[:2], dtype=torch.bool, device=features.device)
@@ -118,4 +128,3 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     run(parse_args())
-
