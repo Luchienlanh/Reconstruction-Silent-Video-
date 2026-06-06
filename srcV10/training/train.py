@@ -321,6 +321,18 @@ def flow_loss(model: torch.nn.Module, outputs: dict[str, torch.Tensor], batch: d
     return raw.flow_loss(outputs, batch)
 
 
+def outputs_are_finite(pred: torch.Tensor, outputs: torch.Tensor | dict[str, torch.Tensor]) -> bool:
+    if not bool(torch.isfinite(pred).all()):
+        return False
+    if not isinstance(outputs, dict):
+        return True
+    for key in ("coarse_mel", "residual_mel", "unit_logits", "prosody"):
+        value = outputs.get(key)
+        if torch.is_tensor(value) and not bool(torch.isfinite(value).all()):
+            return False
+    return True
+
+
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, args, epoch: int) -> dict[str, float]:
     model.train()
     raw = unwrap_model(model)
@@ -335,15 +347,12 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, args, e
     autocast_dtype = amp_torch_dtype(args)
     totals = {"loss": 0.0, "mel": 0.0, "unit": 0.0, "prosody": 0.0, "flow": 0.0, "unit_acc": 0.0}
     count = 0
-    for batch in tqdm(loader, desc="train", leave=False):
-        batch = sanitize_batch(batch_to_device(batch, device))
-        batch["return_aux"] = True
-        optimizer.zero_grad(set_to_none=True)
-        if freeze_visual:
-            raw.encoder.visual.eval()
-        with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=autocast_dtype):
+
+    def forward_losses(batch: dict, use_amp: bool):
+        with torch.amp.autocast("cuda", enabled=use_amp, dtype=autocast_dtype):
             outputs = model(batch)
             pred = outputs["mel"] if isinstance(outputs, dict) else outputs
+        finite_outputs = outputs_are_finite(pred, outputs)
         with torch.amp.autocast("cuda", enabled=False):
             mel_loss = criterion(pred.float(), batch["mel"].float(), batch["mel_mask"])
             unit_logits = outputs.get("unit_logits") if isinstance(outputs, dict) else None
@@ -356,7 +365,29 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, args, e
                 + float(args.prosody_loss_weight) * pros
                 + float(args.flow_loss_weight) * flow
             )
-        if not torch.isfinite(loss):
+        return outputs, pred, mel_loss, unit, pros, flow, loss, finite_outputs
+
+    for batch in tqdm(loader, desc="train", leave=False):
+        batch = sanitize_batch(batch_to_device(batch, device))
+        batch["return_aux"] = True
+        optimizer.zero_grad(set_to_none=True)
+        if freeze_visual:
+            raw.encoder.visual.eval()
+        outputs, pred, mel_loss, unit, pros, flow, loss, finite_outputs = forward_losses(batch, amp_enabled)
+        if amp_enabled and (not finite_outputs or not torch.isfinite(loss)):
+            print(
+                f"[amp] non-finite output/loss with dtype={getattr(args, 'amp_resolved_dtype', 'off')}; "
+                "retrying this batch in FP32 and disabling AMP for the rest of training."
+            )
+            args.amp_enabled = False
+            args.amp_resolved_dtype = "off"
+            args.amp_scaler_enabled = False
+            amp_enabled = False
+            if hasattr(scaler, "_enabled"):
+                scaler._enabled = False
+            optimizer.zero_grad(set_to_none=True)
+            outputs, pred, mel_loss, unit, pros, flow, loss, finite_outputs = forward_losses(batch, False)
+        if (not finite_outputs) or (not torch.isfinite(loss)):
             pred_finite = bool(torch.isfinite(pred).all())
             raise FloatingPointError(
                 "Non-finite train loss "
@@ -370,10 +401,17 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, args, e
             )
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
+        grad_norm = None
         if args.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            if not bool(torch.isfinite(grad_norm)):
+                print(f"[warn] non-finite grad_norm at paths={batch.get('paths', [])[:4]}; skipping optimizer step.")
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                continue
         scaler.step(optimizer)
         scaler.update()
+        unit_logits = outputs.get("unit_logits") if isinstance(outputs, dict) else None
         totals["loss"] += float(loss.detach().cpu())
         totals["mel"] += float(mel_loss.detach().cpu())
         totals["unit"] += float(unit.detach().cpu())
