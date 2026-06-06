@@ -8,24 +8,28 @@ The main goal is accessibility-friendly text/subtitle output. Audio should be ad
 silent video -> srcV11 text -> fixed MC/native-speaker TTS -> wav
 ```
 
-## 1. Cache AV-HuBERT Features
+## 1A. Cache Native Features, No AV-HuBERT
 
 ```bash
-python -m srcV8.training.cache_avhubert_features \
+python -m srcV11.training.cache_native_features \
   --data-dir Processed_Data_R2INR_LRS2_10k \
-  --output-dir Processed_Data_AVHubertFeatures_LRS2_10k \
-  --avhubert-dir path/to/av_hubert \
-  --checkpoint path/to/avhubert_checkpoint.pt \
-  --batch-size 1 \
+  --output-dir Processed_Data_NativeFeatures_LRS2_10k \
+  --batch-size 4 \
   --device cuda \
   --amp
 ```
+
+This fallback does not need `av_hubert`, `fairseq`, or Python 3.8. It is weaker than AV-HuBERT but works on Kaggle's current Python runtime.
+
+## 1B. Optional: Cache AV-HuBERT Features
+
+Use this later on a Python/fairseq environment that supports the official AV-HuBERT stack.
 
 ## 2. Smoke Train
 
 ```bash
 python -m srcV11.training.train_ctc \
-  --feature-dir Processed_Data_AVHubertFeatures_LRS2_10k \
+  --feature-dir Processed_Data_NativeFeatures_LRS2_10k \
   --output-dir tmp_srcV11_smoke \
   --epochs 1 \
   --limit-files 8 \
@@ -37,7 +41,7 @@ python -m srcV11.training.train_ctc \
 
 ```bash
 python -m srcV11.training.train_ctc \
-  --feature-dir Processed_Data_AVHubertFeatures_LRS2_10k \
+  --feature-dir Processed_Data_NativeFeatures_LRS2_10k \
   --output-dir checkpoints_srcV11_lrs2_char_ctc \
   --epochs 80 \
   --batch-size 8 \
@@ -51,7 +55,7 @@ Use `best_model.pth`; it is selected by lowest validation CER.
 
 ```bash
 python -m srcV11.inference.infer_ctc \
-  --feature-dir Processed_Data_AVHubertFeatures_LRS2_10k \
+  --feature-dir Processed_Data_NativeFeatures_LRS2_10k \
   --checkpoint checkpoints_srcV11_lrs2_char_ctc/best_model.pth \
   --output-dir infer_srcV11 \
   --split val \
