@@ -120,6 +120,7 @@ def save_checkpoint(
     config: dict[str, Any],
     epoch: int,
     val_loss: float,
+    best_val: float | None = None,
 ) -> None:
     torch.save(
         {
@@ -130,6 +131,7 @@ def save_checkpoint(
             "config": config,
             "epoch": epoch,
             "val_loss": val_loss,
+            "best_val": val_loss if best_val is None else best_val,
             "vocab_size": tokenizer.vocab_size,
         },
         path,
@@ -166,18 +168,29 @@ def main() -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=bool(config["training"].get("amp", False)) and device.type == "cuda")
 
     best_val = float("inf")
+    start_epoch = 1
+    resume_from = str(config["training"].get("resume_from", "") or "")
+    if resume_from:
+        checkpoint = torch.load(resume_from, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        best_val = float(checkpoint.get("best_val", checkpoint.get("val_loss", best_val)))
+        print(f"resumed from {resume_from} at epoch {start_epoch} with best_val={best_val:.5f}")
+
     epochs = int(config["training"]["epochs"])
     start = time.time()
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         train_loss = run_epoch(model, train_loader, optimizer, scaler, config, device, epoch)
         with torch.no_grad():
             val_loss = run_epoch(model, val_loader, None, None, config, device, epoch)
 
         latest_path = output_dir / "latest_model.pth"
-        save_checkpoint(latest_path, model, optimizer, tokenizer, config, epoch, val_loss)
+        save_checkpoint(latest_path, model, optimizer, tokenizer, config, epoch, val_loss, best_val)
         if val_loss < best_val:
             best_val = val_loss
-            save_checkpoint(output_dir / "best_model.pth", model, optimizer, tokenizer, config, epoch, val_loss)
+            save_checkpoint(output_dir / "best_model.pth", model, optimizer, tokenizer, config, epoch, val_loss, best_val)
 
         elapsed = time.time() - start
         print(
