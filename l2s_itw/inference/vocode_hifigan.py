@@ -51,7 +51,7 @@ def load_mel(path: str | Path) -> torch.Tensor:
 
 
 def load_generator(hifigan_dir: str | Path, device: torch.device) -> torch.nn.Module:
-    hifigan_dir = Path(hifigan_dir)
+    hifigan_dir = resolve_hifigan_dir(hifigan_dir)
     with (hifigan_dir / "hyperparams.yaml").open("r", encoding="utf-8") as f:
         hparams = load_hyperpyyaml(f)
     generator = hparams["generator"].to(device)
@@ -59,6 +59,29 @@ def load_generator(hifigan_dir: str | Path, device: torch.device) -> torch.nn.Mo
     generator.load_state_dict(state_dict)
     generator.eval()
     return generator
+
+
+def resolve_hifigan_dir(hifigan_dir: str | Path) -> Path:
+    path = Path(hifigan_dir)
+    if (path / "hyperparams.yaml").exists():
+        return path
+
+    repo_id = str(hifigan_dir)
+    if "/" not in repo_id:
+        raise FileNotFoundError(f"HiFi-GAN directory is missing hyperparams.yaml: {path}")
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise ImportError(
+            "Install huggingface_hub or pass a local --hifigan-dir containing hyperparams.yaml."
+        ) from exc
+
+    downloaded = snapshot_download(repo_id=repo_id)
+    downloaded_path = Path(downloaded)
+    if not (downloaded_path / "hyperparams.yaml").exists():
+        raise FileNotFoundError(f"Downloaded HiFi-GAN repo has no hyperparams.yaml: {downloaded_path}")
+    return downloaded_path
 
 
 def main() -> None:
