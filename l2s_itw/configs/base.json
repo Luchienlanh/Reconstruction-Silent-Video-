@@ -1,0 +1,58 @@
+{
+  "seed": 1234,
+  "data": {
+    "train_manifest": "",
+    "val_manifest": "",
+    "visual_feature_key": "visual_feature_path",
+    "mel_key": "mel_path",
+    "speaker_embedding_key": "speaker_embedding_path",
+    "text_key": "text",
+    "sample_rate": 16000,
+    "n_mels": 80
+  },
+  "provider": {
+    "name": "vtp",
+    "repo_dir": "external/vtp",
+    "ckpt_path": "pretrained_models/vtp/ft_lrs2_or_lrs3.pth",
+    "cnn_ckpt_path": "pretrained_models/vtp/feature_extractor.pth",
+    "builder": "vtp24x24",
+    "device": "cuda",
+    "beam_size": 30,
+    "max_decode_len": 35,
+    "chunk_size": 100
+  },
+  "text": {
+    "symbols": "abcdefghijklmnopqrstuvwxyz '.,?!-",
+    "lowercase": true
+  },
+  "model": {
+    "visual_dim": 512,
+    "speaker_dim": 256,
+    "hidden_dim": 256,
+    "num_heads": 4,
+    "text_layers": 4,
+    "visual_layers": 4,
+    "decoder_layers": 6,
+    "ffn_dim": 1024,
+    "dropout": 0.1,
+    "mel_upsample": 4,
+    "mel_frames_per_video_frame": 4.0,
+    "n_mels": 80
+  },
+  "training": {
+    "output_dir": "checkpoints_l2s_itw",
+    "epochs": 50,
+    "batch_size": 8,
+    "lr": 0.0002,
+    "weight_decay": 0.00001,
+    "grad_clip": 1.0,
+    "num_workers": 0,
+    "device": "cuda",
+    "amp": true,
+    "log_every": 20,
+    "limit_samples": 0
+  },
+  "inference": {
+    "vocoder": "mel_only"
+  }
+}
