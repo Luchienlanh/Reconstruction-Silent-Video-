@@ -4,6 +4,8 @@ import argparse
 import json
 import random
 import re
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +76,35 @@ def write_rows(rows: list[dict[str, Any]], path: Path) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _process_row(row: dict[str, Any], cache_dir: Path, min_conf: int, min_seconds: float) -> tuple[dict[str, Any] | None, str | None]:
+    visual_path = Path(resolve_path(str(row["visual_feature_path"]), cache_dir))
+    if not visual_path.exists():
+        return None, "missing_visual"
+    if not row.get("source_text_path"):
+        return None, "missing_gt"
+    gt_text, conf = parse_lrs2_text(row["source_text_path"])
+    if not gt_text:
+        return None, "missing_gt"
+    if min_conf and (conf is None or conf < min_conf):
+        return None, "low_conf"
+    sample_seconds = seconds(row)
+    if min_seconds and sample_seconds is not None and sample_seconds < min_seconds:
+        return None, "short"
+
+    res = {
+        "id": row["id"],
+        "visual_feature_path": str(visual_path),
+        "vtp_text": str(row.get("text", "")),
+        "gt_text": gt_text,
+        "conf": conf,
+        "split": row.get("split", ""),
+        "seconds": sample_seconds,
+        "source_text_path": row.get("source_text_path", ""),
+        "source_video_path": row.get("source_video_path") or row.get("video_path", ""),
+    }
+    return res, None
+
+
 def main() -> None:
     args = parse_args()
     cache_manifest = Path(args.cache_manifest)
@@ -82,39 +113,22 @@ def main() -> None:
     prepared = []
     skipped = {"missing_visual": 0, "missing_gt": 0, "low_conf": 0, "short": 0}
 
-    for row in tqdm(rows, desc="prepare l2t_arch"):
-        visual_path = Path(resolve_path(str(row["visual_feature_path"]), cache_dir))
-        if not visual_path.exists():
-            skipped["missing_visual"] += 1
-            continue
-        if not row.get("source_text_path"):
-            skipped["missing_gt"] += 1
-            continue
-        gt_text, conf = parse_lrs2_text(row["source_text_path"])
-        if not gt_text:
-            skipped["missing_gt"] += 1
-            continue
-        if args.min_conf and (conf is None or conf < args.min_conf):
-            skipped["low_conf"] += 1
-            continue
-        sample_seconds = seconds(row)
-        if args.min_seconds and sample_seconds is not None and sample_seconds < args.min_seconds:
-            skipped["short"] += 1
-            continue
+    # Tối ưu cho CPU AMD Ryzen 5 5600X (12 threads) và RAM 16GB:
+    # Sử dụng ThreadPoolExecutor thay vì ProcessPoolExecutor để tránh copy dữ liệu (IPC) gây tốn RAM.
+    # Vì quá trình này chủ yếu là I/O bound (đọc ổ đĩa), ta có thể dùng số luồng (threads) gấp đôi số luồng CPU (24 threads) để tối đa hoá tốc độ đọc đĩa.
+    max_workers = min((os.cpu_count() or 6) * 2, 24)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_process_row, row, cache_dir, args.min_conf, args.min_seconds)
+            for row in rows
+        ]
 
-        prepared.append(
-            {
-                "id": row["id"],
-                "visual_feature_path": str(visual_path),
-                "vtp_text": str(row.get("text", "")),
-                "gt_text": gt_text,
-                "conf": conf,
-                "split": row.get("split", ""),
-                "seconds": sample_seconds,
-                "source_text_path": row.get("source_text_path", ""),
-                "source_video_path": row.get("source_video_path") or row.get("video_path", ""),
-            }
-        )
+        for future in tqdm(as_completed(futures), total=len(futures), desc=f"prepare l2t_arch (w={max_workers})"):
+            res, skip_reason = future.result()
+            if skip_reason:
+                skipped[skip_reason] += 1
+            elif res is not None:
+                prepared.append(res)
 
     if len(prepared) < 3:
         raise ValueError(f"Need at least 3 usable rows, got {len(prepared)}. skipped={skipped}")
