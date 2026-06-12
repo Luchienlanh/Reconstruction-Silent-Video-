@@ -25,6 +25,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-mels", type=int, default=80)
     parser.add_argument("--f-min", type=float, default=0.0)
     parser.add_argument("--f-max", type=float, default=8000.0)
+    parser.add_argument(
+        "--normalize-mel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Normalize each linear mel by its sample max before log; matches the existing HiFi-GAN-compatible cache.",
+    )
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--skip-errors", action="store_true")
@@ -83,6 +89,11 @@ def load_waveform(path: Path, sample_rate: int) -> tuple[torch.Tensor, int]:
 
 
 def log_mel_from_waveform(wav: torch.Tensor, sample_rate: int, args: argparse.Namespace) -> torch.Tensor:
+    def finalize_mel(mel: torch.Tensor) -> torch.Tensor:
+        if bool(args.normalize_mel):
+            mel = mel / mel.amax().clamp_min(1e-5)
+        return torch.log(mel.clamp_min(1e-5))
+
     try:
         import torchaudio
 
@@ -98,7 +109,7 @@ def log_mel_from_waveform(wav: torch.Tensor, sample_rate: int, args: argparse.Na
             center=True,
         )
         mel = mel_fn(wav).squeeze(0).transpose(0, 1).contiguous()
-        return torch.log(mel.clamp_min(1e-5))
+        return finalize_mel(mel)
     except Exception:
         import librosa
 
@@ -114,7 +125,7 @@ def log_mel_from_waveform(wav: torch.Tensor, sample_rate: int, args: argparse.Na
             power=1.0,
             center=True,
         )
-        return torch.from_numpy(mel_np.T).float().clamp_min(1e-5).log()
+        return finalize_mel(torch.from_numpy(mel_np.T).float())
 
 
 def main() -> None:
@@ -151,6 +162,7 @@ def main() -> None:
                         "win_length": int(args.win_length),
                         "hop_length": int(args.hop_length),
                         "n_mels": int(args.n_mels),
+                        "normalize_mel": bool(args.normalize_mel),
                     },
                     mel_path,
                 )
