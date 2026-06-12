@@ -1,0 +1,47 @@
+{
+  "data": {
+    "train_manifest": "datasets_l2t_arch_50k/train.jsonl",
+    "val_manifest": "datasets_l2t_arch_50k/val.jsonl"
+  },
+  "text": {
+    "symbols": "abcdefghijklmnopqrstuvwxyz '"
+  },
+  "model": {
+    "type": "dual_plif_monotonic",
+    "visual_dim": 512,
+    "hidden_dim": 192,
+    "num_heads": 4,
+    "visual_layers": 3,
+    "decoder_layers": 3,
+    "ffn_dim": 768,
+    "short_plif_init_beta": 0.75,
+    "long_plif_init_beta": 0.95,
+    "plif_beta_min": 0.1,
+    "plif_beta_max": 0.995,
+    "plif_threshold": 1.0,
+    "plif_slope": 5.0,
+    "plif_spike_gate": true,
+    "monotonic_attention": true,
+    "monotonic_frames_per_token": 2.0,
+    "monotonic_left_window": 8.0,
+    "monotonic_right_window": 16.0,
+    "monotonic_bias_strength": 2.0,
+    "monotonic_hard_window": false,
+    "ctc_aux": true,
+    "dropout": 0.2
+  },
+  "training": {
+    "output_dir": "checkpoints_l2t_arch_dual_plif_monotonic_ctc_aux",
+    "batch_size": 16,
+    "epochs": 25,
+    "lr": 0.0001,
+    "weight_decay": 0.0001,
+    "ctc_weight": 0.1,
+    "spike_reg_weight": 0.001,
+    "grad_clip": 1.0,
+    "num_workers": 2,
+    "device": "cuda",
+    "amp": true,
+    "limit_samples": 0
+  }
+}

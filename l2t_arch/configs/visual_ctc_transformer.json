@@ -1,0 +1,32 @@
+{
+  "data": {
+    "train_manifest": "datasets_l2t_arch_50k/train.jsonl",
+    "val_manifest": "datasets_l2t_arch_50k/val.jsonl"
+  },
+  "text": {
+    "symbols": "abcdefghijklmnopqrstuvwxyz '"
+  },
+  "model": {
+    "type": "visual_ctc",
+    "visual_encoder": "transformer",
+    "visual_dim": 512,
+    "hidden_dim": 192,
+    "num_heads": 4,
+    "visual_layers": 3,
+    "ffn_dim": 768,
+    "dropout": 0.2
+  },
+  "training": {
+    "output_dir": "checkpoints_l2t_arch_visual_ctc_transformer",
+    "batch_size": 16,
+    "epochs": 25,
+    "lr": 0.0001,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "num_workers": 2,
+    "device": "cuda",
+    "amp": true,
+    "limit_samples": 0
+  }
+}
+
