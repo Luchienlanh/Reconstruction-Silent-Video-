@@ -7,6 +7,7 @@ __pycache__/
 checkpoints*/
 checkpoints_*/
 *_checkpoints/
+tmp_srcV11_*/
 pretrained_models/
 FullFrame_test/
 Processed_Data_Mel_HiFiGAN/
@@ -21,4 +22,32 @@ Speech Reconstruction
 vtv24_videos
 downloaded_vtv24.txt
 meta.txt
+
+# Third-party repos and generated lip-to-speech artifacts
+external/
+cache_l2s_itw*/
+data_l2s_itw_export*/
+data_l2s_itw*/
+infer_l2s_itw*/
+manifests_l2s_itw*/
+tmp_l2s_itw*/
+reports_l2t*/
+datasets_l2t_arch*/
+reports_l2t_arch*/
+tmp_l2t*/
+.demo_logs/
+outputtrainning*/
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.toc
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
 video tin tức - tái tạo âm - text.txt
